@@ -1,7 +1,7 @@
-use api::{baton::BatonApi, instance::InstanceApi};
+use api::instance::InstanceApi;
 use poem::{listener::TcpListener, Route};
 use poem_openapi::OpenApiService;
-use rand::{distr::{Alphanumeric, SampleString}, random};
+use rand::distr::{Alphanumeric, SampleString};
 use serde::Deserialize;
 use sqlx::PgPool;
 

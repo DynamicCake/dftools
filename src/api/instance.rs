@@ -1,6 +1,3 @@
-use std::hash::Hash;
-
-use hmac::digest::generic_array::GenericArray;
 use poem_openapi::{
     param::Query,
     payload::{Json, PlainText},
@@ -140,10 +137,12 @@ impl InstanceApi {
                 return RegisterResult::InvalidDomain;
             }
         }
-        let uuid = self
-            .get_uuid(auth.0.owner)
-            .await
-            .expect("mojang should cooperate");
+        let uuid = if let Some(id) = self.get_uuid(auth.0.owner).await {
+            id
+        } else {
+            return RegisterResult::CannotFetchUuid;
+        };
+
         match query!(
             "INSERT INTO plot (id, owner_uuid, instance) VALUES ($1, $2, $3)",
             id,
@@ -167,6 +166,36 @@ impl InstanceApi {
 
         RegisterResult::Success
     }
+
+    #[oai(path = "/plot", method = "put")]
+    async fn replace_instance(&self, instance: Json<Instance>, auth: PlotAuth) -> ReplaceInstanceResult {
+        let id = auth.0.plot_id;
+        if let Some(name) = &instance.name {
+            if !self.domain_vibe_check(name).await {
+                return ReplaceInstanceResult::InvalidDomain;
+            }
+        }
+        query!(
+            "UPDATE plot SET
+            instance = $2
+            WHERE id = $1",
+            id,
+            instance.name
+        )
+        .execute(&self.pg)
+        .await
+        .expect("db shouldn't fail");
+
+        ReplaceInstanceResult::Success
+    }
+}
+
+#[derive(ApiResponse)]
+enum ReplaceInstanceResult {
+    #[oai(status = 400)]
+    InvalidDomain,
+    #[oai(status = 200)]
+    Success,
 }
 
 #[derive(ApiResponse)]
