@@ -23,6 +23,7 @@
           pkg-config
           openssl
           sqlx-cli
+          clippy
         ];
       };
     });

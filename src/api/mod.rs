@@ -6,10 +6,14 @@ use serde::{Deserialize, Serialize};
 use tracing::{error, info};
 
 pub mod baton;
+pub mod instance;
+
+// They cannot be negative, it is just because postgres can return negatives
+pub type PlotId = i32;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Plot {
-    plot_id: u64,
+    plot_id: PlotId,
     owner: String,
 }
 
@@ -54,7 +58,7 @@ fn parse_user_agent(header: &str) -> Option<Plot> {
     let (_, right) = header.split_once("(")?;
     let (plot_id, username) = right.split_once(", ")?;
     let (username, _) = username.split_once(")")?;
-    let plot_id: u64 = plot_id.parse().ok()?;
+    let plot_id: PlotId = plot_id.parse().ok()?;
     Some(Plot {
         plot_id,
         owner: username.to_string(),
