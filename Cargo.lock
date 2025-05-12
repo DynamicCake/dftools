@@ -151,6 +151,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ascii_domain"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b47fbe4e3e4e30d6056dac36592935e4062efb1f33e71a20d3d0431d11d7d84e"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "atoi"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -576,6 +585,7 @@ name = "dftools"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "ascii_domain",
  "base64 0.22.1",
  "chrono",
  "clap",
@@ -2006,6 +2016,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "url",
+ "uuid",
 ]
 
 [[package]]

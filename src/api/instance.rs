@@ -1,9 +1,13 @@
+use ascii_domain::{
+    char_set::{AllowedAscii, ASCII_LOWERCASE},
+    dom::Domain,
+};
 use poem_openapi::{
     param::Query,
     payload::{Json, PlainText},
     ApiResponse, Object, OpenApi,
 };
-use redis::{aio::MultiplexedConnection, AsyncCommands};
+use redis::{aio::MultiplexedConnection, AsyncCommands, FromRedisValue, RedisError, RedisResult};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sqlx::{query, query_as, Pool, Postgres};
@@ -15,8 +19,111 @@ use super::{PlotAuth, PlotId};
 pub struct InstanceApi {
     pub pg: Pool<Postgres>,
     pub redis: MultiplexedConnection,
-    pub instance_domain: String,
+    pub instance_domain: Domain<String>,
     pub self_check_key: String,
+}
+
+#[derive(ApiResponse)]
+pub enum VibeCheckResult {
+    #[oai(status = 204)]
+    Passed,
+    #[oai(status = 200)]
+    KeyPassed(PlainText<&'static str>),
+    #[oai(status = 400)]
+    KeyVibecheckFailed,
+}
+
+#[OpenApi]
+impl InstanceApi {
+    #[oai(path = "/vibecheck", method = "get")]
+    async fn vibecheck(&self, key: Query<Option<String>>) -> VibeCheckResult {
+        if let Some(key) = key.0 {
+            let hash: [u8; 32] = Sha256::digest(key).into();
+            let actual = self.get_vibecheck_hash();
+            if hash == actual {
+                return VibeCheckResult::KeyPassed(PlainText("You are you"));
+            } else {
+                return VibeCheckResult::KeyVibecheckFailed;
+            }
+        }
+        VibeCheckResult::Passed
+    }
+
+    #[oai(path = "/plot", method = "get")]
+    async fn get_plot_instance(&self, id: Query<PlotId>) -> PlotFetchResult {
+        if let Some(instance) =
+            Self::find_plot_instance(&self.pg, self.redis.clone(), id.0, &self.instance_domain)
+                .await
+        {
+            PlotFetchResult::Ok(Json(instance.to_string()))
+        } else {
+            PlotFetchResult::NotFound
+        }
+    }
+
+    #[oai(path = "/plot", method = "post")]
+    async fn register(&self, instance: Json<Instance>, auth: PlotAuth) -> RegisterResult {
+        let id = auth.0.plot_id;
+        if let Some(name) = &instance.name {
+            if !self.domain_vibe_check(name).await {
+                return RegisterResult::InvalidDomain;
+            }
+        }
+        let uuid = if let Some(id) = self.get_uuid(auth.0.owner).await {
+            id
+        } else {
+            return RegisterResult::CannotFetchUuid;
+        };
+
+        match query!(
+            "INSERT INTO plot (id, owner_uuid, instance) VALUES ($1, $2, $3)",
+            id,
+            uuid,
+            instance.name
+        )
+        .execute(&self.pg)
+        .await
+        {
+            Ok(_) => (),
+            Err(err) => match err {
+                sqlx::Error::Database(err) => match err.kind() {
+                    sqlx::error::ErrorKind::UniqueViolation => {
+                        return RegisterResult::UserAlreadyExists
+                    }
+                    err => panic!("{:?}", err),
+                },
+                err => panic!("{:?}", err),
+            },
+        }
+
+        RegisterResult::Success
+    }
+
+    #[oai(path = "/plot", method = "put")]
+    async fn replace_instance(
+        &self,
+        instance: Json<Instance>,
+        auth: PlotAuth,
+    ) -> ReplaceInstanceResult {
+        let id = auth.0.plot_id;
+        if let Some(name) = &instance.name {
+            if !self.domain_vibe_check(name).await {
+                return ReplaceInstanceResult::InvalidDomain;
+            }
+        }
+        query!(
+            "UPDATE plot SET
+            instance = $2
+            WHERE id = $1",
+            id,
+            instance.name
+        )
+        .execute(&self.pg)
+        .await
+        .expect("db shouldn't fail");
+
+        ReplaceInstanceResult::Success
+    }
 }
 
 impl InstanceApi {
@@ -78,116 +185,54 @@ impl InstanceApi {
     }
 }
 
-#[derive(ApiResponse)]
-pub enum VibeCheckResult {
-    #[oai(status = 204)]
-    Passed,
-    #[oai(status = 200)]
-    KeyPassed(PlainText<&'static str>),
-    #[oai(status = 400)]
-    KeyVibecheckFailed,
+impl InstanceApi {
+    pub async fn find_plot_instance(
+        pg: &Pool<Postgres>,
+        mut redis: MultiplexedConnection,
+        plot_id: PlotId,
+        instance_domain: &Domain<String>,
+    ) -> Option<Domain<String>> {
+        let found: Option<String> = redis
+            .get(format!("plot:{}:instance", plot_id))
+            .await
+            .expect("redis shouldn't fail");
+        return if let Some(instance) = found {
+            Some(
+                Domain::try_from_bytes(instance, &ASCII_LOWERCASE)
+                    .expect("All items in redis should be valid"),
+            )
+        } else {
+            let row = query_as!(
+                PlotRow,
+                "SELECT id, owner_uuid, instance FROM plot
+            WHERE id = $1;",
+                plot_id
+            )
+            .fetch_optional(pg)
+            .await
+            .expect("db shouldn't fail");
+            if let Some(row) = row {
+                let instance_str = row.instance.clone().unwrap_or(instance_domain.to_string());
+                let _: () = redis
+                    .set(format!("plot:{}:instance", plot_id), &instance_str)
+                    .await
+                    .expect("redis shouldn't fail");
+                let instance = match row.instance {
+                    Some(instance) => Domain::try_from_bytes(instance, &ASCII_LOWERCASE)
+                        .expect("db should contain valid domains"),
+                    None => instance_domain.clone(),
+                };
+                Some(instance)
+            } else {
+                None
+            }
+        };
+    }
 }
 
-#[OpenApi]
-impl InstanceApi {
-    #[oai(path = "/vibecheck", method = "get")]
-    async fn vibecheck(&self, key: Query<Option<String>>) -> VibeCheckResult {
-        if let Some(key) = key.0 {
-            let hash: [u8; 32] = Sha256::digest(key).into();
-            let actual = self.get_vibecheck_hash();
-            if hash == actual {
-                return VibeCheckResult::KeyPassed(PlainText("You are you"));
-            } else {
-                return VibeCheckResult::KeyVibecheckFailed;
-            }
-        }
-        VibeCheckResult::Passed
-    }
-
-    #[oai(path = "/plot", method = "get")]
-    async fn get_plot(&self, id: Query<PlotId>) -> PlotFetchResult {
-        let id = id.0 as i32;
-        let row = query_as!(
-            PlotRow,
-            "SELECT id, owner_uuid, instance FROM plot
-            WHERE id = $1;",
-            id
-        )
-        .fetch_optional(&self.pg)
-        .await
-        .expect("db shouldn't fail");
-        let row = if let Some(it) = row {
-            it
-        } else {
-            return PlotFetchResult::NotFound;
-        };
-
-        PlotFetchResult::Ok(Json(Plot {
-            plot: row.id as PlotId,
-            owner: row.owner_uuid.to_string(),
-            instance: row.instance.unwrap_or(self.instance_domain.clone()),
-        }))
-    }
-
-    #[oai(path = "/plot", method = "post")]
-    async fn register(&self, instance: Json<Instance>, auth: PlotAuth) -> RegisterResult {
-        let id = auth.0.plot_id;
-        if let Some(name) = &instance.name {
-            if !self.domain_vibe_check(name).await {
-                return RegisterResult::InvalidDomain;
-            }
-        }
-        let uuid = if let Some(id) = self.get_uuid(auth.0.owner).await {
-            id
-        } else {
-            return RegisterResult::CannotFetchUuid;
-        };
-
-        match query!(
-            "INSERT INTO plot (id, owner_uuid, instance) VALUES ($1, $2, $3)",
-            id,
-            uuid,
-            instance.name
-        )
-        .execute(&self.pg)
-        .await
-        {
-            Ok(_) => (),
-            Err(err) => match err {
-                sqlx::Error::Database(err) => match err.kind() {
-                    sqlx::error::ErrorKind::UniqueViolation => {
-                        return RegisterResult::UserAlreadyExists
-                    }
-                    err => panic!("{:?}", err),
-                },
-                err => panic!("{:?}", err),
-            },
-        }
-
-        RegisterResult::Success
-    }
-
-    #[oai(path = "/plot", method = "put")]
-    async fn replace_instance(&self, instance: Json<Instance>, auth: PlotAuth) -> ReplaceInstanceResult {
-        let id = auth.0.plot_id;
-        if let Some(name) = &instance.name {
-            if !self.domain_vibe_check(name).await {
-                return ReplaceInstanceResult::InvalidDomain;
-            }
-        }
-        query!(
-            "UPDATE plot SET
-            instance = $2
-            WHERE id = $1",
-            id,
-            instance.name
-        )
-        .execute(&self.pg)
-        .await
-        .expect("db shouldn't fail");
-
-        ReplaceInstanceResult::Success
-    }
+struct PlotValue {
+    owner: Uuid,
+    instance: Option<String>,
 }
 
 #[derive(ApiResponse)]
@@ -226,11 +271,11 @@ enum PlotFetchResult {
     #[oai(status = 404)]
     NotFound,
     #[oai(status = 200)]
-    Ok(Json<Plot>),
+    Ok(Json<String>),
 }
 
 #[derive(Object)]
-struct Plot {
+pub struct PlotResponse {
     plot: PlotId,
     owner: String,
     instance: String,

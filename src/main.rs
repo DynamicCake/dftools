@@ -1,4 +1,5 @@
-use api::instance::InstanceApi;
+use api::{baton::BatonApi, instance::InstanceApi};
+use ascii_domain::{char_set::ASCII_LOWERCASE, dom::Domain};
 use poem::{listener::TcpListener, Route};
 use poem_openapi::OpenApiService;
 use rand::distr::{Alphanumeric, SampleString};
@@ -22,19 +23,24 @@ async fn main() -> color_eyre::Result<()> {
     let client = redis::Client::open(config.redis_url).unwrap();
     let redis = client.get_multiplexed_async_connection().await?;
 
-    let api_service = OpenApiService::new(
+    let instance_api_service = OpenApiService::new(
         InstanceApi {
-            pg,
-            redis,
-            instance_domain: config.domain,
+            pg: pg.clone(),
+            redis: redis.clone(),
+            instance_domain: Domain::try_from_bytes(config.domain, &ASCII_LOWERCASE),
             self_check_key: random_key(),
         },
         "Instance API",
-        "1.0",
+        "0.0.1",
     )
-    .server("http://localhost:3000/instance/v1");
-    let ui = api_service.swagger_ui();
-    let app = Route::new().nest("/instance/v1", api_service).nest("/", ui);
+    .server("http://localhost:3000/instance/v0");
+    let baton_api_service = OpenApiService::new(BatonApi { pg, redis }, "Baton API", "0.0.1");
+
+    let app = Route::new()
+        .nest("/instance/v0/docs", instance_api_service.swagger_ui())
+        .nest("/instance/v0", instance_api_service)
+        .nest("/baton/v0/docs", baton_api_service.swagger_ui())
+        .nest("/baton/v0", baton_api_service);
 
     let _ = poem::Server::new(TcpListener::bind(format!("0.0.0.0:{}", config.port)))
         .run(app)
