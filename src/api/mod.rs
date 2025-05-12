@@ -1,7 +1,8 @@
 use std::net::{Ipv4Addr, SocketAddr};
 
-use poem::Request;
-use poem_openapi::{auth::ApiKey, SecurityScheme};
+use poem::{error::ResponseError, Request};
+use poem_openapi::{auth::ApiKey, ApiResponse, SecurityScheme};
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
 
@@ -27,24 +28,51 @@ pub struct Plot {
 )]
 pub struct PlotAuth(Plot);
 
-async fn api_checker(req: &Request, api_key: ApiKey) -> Option<Plot> {
-    let remote_addr = match *req.remote_addr().as_socket_addr()? {
+#[cfg(debug_assertions)]
+const DF_IPS: [Ipv4Addr; 2] = [
+    Ipv4Addr::new(127, 0, 0, 1),
+    Ipv4Addr::new(51, 222, 245, 229),
+];
+/// DynamicCake: I will only add IPs I see with my own two eyes
+#[cfg(not(debug_assertions))]
+const DF_IPS: [Ipv4Addr; 1] = [Ipv4Addr::new(51, 222, 245, 229)];
+
+async fn api_checker(req: &Request, api_key: ApiKey) -> poem::Result<Plot> {
+    let addr = req
+        .remote_addr()
+        .as_socket_addr()
+        .ok_or(ApiCheckError::NotInternetSocketAddr)?;
+    let remote_addr = match *addr {
         SocketAddr::V4(addr) => addr,
-        SocketAddr::V6(_) => return None,
+        SocketAddr::V6(_) => return Err(ApiCheckError::NotIpv4.into()),
     };
-    const VALID_IPS: [Ipv4Addr; 2] = [
-        Ipv4Addr::new(127, 0, 0, 1),
-        Ipv4Addr::new(51, 222, 245, 229),
-    ];
-    if !VALID_IPS.contains(remote_addr.ip()) {
+    if !DF_IPS.contains(remote_addr.ip()) {
         info!("Denied ip {}", req.remote_addr());
-        return None;
+        return Err(ApiCheckError::InvalidIp.into());
     }
     if let Some(plot) = parse_user_agent(&api_key.key) {
-        Some(plot)
+        Ok(plot)
     } else {
         error!("Malformed user agent {}", api_key.key);
-        None
+        Err(ApiCheckError::MalformedUserAgent.into())
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ApiCheckError {
+    #[error("Must be socket error")]
+    NotInternetSocketAddr,
+    #[error("Must be ipv4")]
+    NotIpv4,
+    #[error("Ip doesn't match ips: {:?}", DF_IPS)]
+    InvalidIp,
+    #[error("Malfored user-agent")]
+    MalformedUserAgent,
+}
+
+impl ResponseError for ApiCheckError {
+    fn status(&self) -> reqwest::StatusCode {
+        return StatusCode::UNAUTHORIZED;
     }
 }
 
