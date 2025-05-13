@@ -1,24 +1,20 @@
-use ascii_domain::{
-    char_set::{AllowedAscii, ASCII_LOWERCASE},
-    dom::Domain,
-};
+use ascii_domain::dom::Domain;
 use poem_openapi::{
     param::Query,
     payload::{Json, PlainText},
     ApiResponse, Object, OpenApi,
 };
-use redis::{aio::MultiplexedConnection, AsyncCommands, FromRedisValue, RedisError, RedisResult};
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use sqlx::{query, query_as, Pool, Postgres};
-use tracing::error;
-use uuid::Uuid;
+
+use crate::{store::{
+    instance::{PlotEditError, RegisterError},
+    Store,
+}, DOMAIN_SET};
 
 use super::{PlotAuth, PlotId};
 
 pub struct InstanceApi {
-    pub pg: Pool<Postgres>,
-    pub redis: MultiplexedConnection,
+    pub store: Store,
     pub instance_domain: Domain<String>,
     pub self_check_key: String,
 }
@@ -51,11 +47,13 @@ impl InstanceApi {
 
     #[oai(path = "/plot", method = "get")]
     async fn get_plot_instance(&self, id: Query<PlotId>) -> PlotFetchResult {
-        if let Some(instance) =
-            Self::find_plot_instance(&self.pg, self.redis.clone(), id.0, &self.instance_domain)
-                .await
+        if let Some(plot) = self
+            .store
+            .find_plot(id.0)
+            .await
+            .expect("Store ops shouldn't fail")
         {
-            PlotFetchResult::Ok(Json(instance.to_string()))
+            PlotFetchResult::Ok(Json(plot.instance.map(|it| it.to_string())))
         } else {
             PlotFetchResult::NotFound
         }
@@ -64,39 +62,38 @@ impl InstanceApi {
     #[oai(path = "/plot", method = "post")]
     async fn register(&self, instance: Json<Instance>, auth: PlotAuth) -> RegisterResult {
         let id = auth.0.plot_id;
-        if let Some(name) = &instance.name {
-            if !self.domain_vibe_check(name).await {
-                return RegisterResult::InvalidDomain;
-            }
-        }
-        let uuid = if let Some(id) = self.get_uuid(auth.0.owner).await {
+        let uuid = if let Some(id) = self
+            .store
+            .get_uuid(auth.0.owner)
+            .await
+            .expect("Store ops shouldn't fail")
+        {
             id
         } else {
             return RegisterResult::CannotFetchUuid;
         };
 
-        match query!(
-            "INSERT INTO plot (id, owner_uuid, instance) VALUES ($1, $2, $3)",
-            id,
-            uuid,
-            instance.name
-        )
-        .execute(&self.pg)
-        .await
+        let domain = if let Some(str) = instance.instance.clone() {
+            if let Ok(it) = Domain::try_from_bytes(str, &DOMAIN_SET) {
+                Some(it)
+            } else {
+                return RegisterResult::InvalidDomain;
+            }
+        } else {
+            None
+        };
+        match self
+            .store
+            .register_plot(id, uuid, domain.as_ref())
+            .await
+            .expect("store shouldn't fail")
         {
-            Ok(_) => (),
+            Ok(_) => RegisterResult::Success,
             Err(err) => match err {
-                sqlx::Error::Database(err) => match err.kind() {
-                    sqlx::error::ErrorKind::UniqueViolation => {
-                        return RegisterResult::UserAlreadyExists
-                    }
-                    err => panic!("{:?}", err),
-                },
-                err => panic!("{:?}", err),
+                RegisterError::InvalidDomain => RegisterResult::InvalidDomain,
+                RegisterError::PlotTaken => RegisterResult::PlotAlreadyExists,
             },
         }
-
-        RegisterResult::Success
     }
 
     #[oai(path = "/plot", method = "put")]
@@ -106,23 +103,28 @@ impl InstanceApi {
         auth: PlotAuth,
     ) -> ReplaceInstanceResult {
         let id = auth.0.plot_id;
-        if let Some(name) = &instance.name {
-            if !self.domain_vibe_check(name).await {
+        let domain = if let Some(str) = instance.instance.clone() {
+            if let Ok(it) = Domain::try_from_bytes(str, &DOMAIN_SET) {
+                Some(it)
+            } else {
                 return ReplaceInstanceResult::InvalidDomain;
             }
+        } else {
+            None
+        };
+        if let Err(err) = self
+            .store
+            .edit_plot(id, domain.as_ref())
+            .await
+            .expect("store ops shouldn't fail")
+        {
+            match err {
+                PlotEditError::InvalidDomain => ReplaceInstanceResult::InvalidDomain,
+                PlotEditError::PlotNotFound => ReplaceInstanceResult::PlotNotFound,
+            }
+        } else {
+            ReplaceInstanceResult::Success
         }
-        query!(
-            "UPDATE plot SET
-            instance = $2
-            WHERE id = $1",
-            id,
-            instance.name
-        )
-        .execute(&self.pg)
-        .await
-        .expect("db shouldn't fail");
-
-        ReplaceInstanceResult::Success
     }
 }
 
@@ -131,114 +133,17 @@ impl InstanceApi {
         let hashed = Sha256::digest(&self.self_check_key);
         hashed.into()
     }
-    async fn get_uuid(&self, name: String) -> Option<Uuid> {
-        let found: Option<String> = self
-            .redis
-            .clone()
-            .get(format!("player:{}:uuid", name))
-            .await
-            .map_err(|err| error!("Insert failed {}", err))
-            .ok()?;
-
-        if let Some(uuid) = found {
-            Some(
-                uuid.parse()
-                    .map_err(|err| error!("Malfored uuid in redis {}", err))
-                    .ok()?,
-            )
-        } else {
-            let call = format!("https://api.mojang.com/users/profiles/minecraft/{}", name);
-
-            let uuid_fetch = if let Ok(it) = reqwest::get(call).await {
-                it
-            } else {
-                error!("Cannot fetch uuid for {}", name);
-                return None;
-            };
-            let text = if let Ok(it) = uuid_fetch.text().await {
-                it
-            } else {
-                error!("Cannot fetch uuid for {}", name);
-                return None;
-            };
-
-            let json: MojangResponse = if let Ok(it) = serde_json::from_str(&text) {
-                error!("Cannot fetch uuid for {}", name);
-                it
-            } else {
-                return None;
-            };
-
-            let _: () = self
-                .redis
-                .clone()
-                .set(format!("player:{}:uuid", name), json.id.to_string())
-                .await
-                .map_err(|err| error!("Insert failed {}", err))
-                .ok()?;
-            Some(json.id)
-        }
-    }
-    async fn domain_vibe_check(&self, _domain: &str) -> bool {
-        // TODO: Implmeent domain vibe check
-        true
-    }
-}
-
-impl InstanceApi {
-    pub async fn find_plot_instance(
-        pg: &Pool<Postgres>,
-        mut redis: MultiplexedConnection,
-        plot_id: PlotId,
-        instance_domain: &Domain<String>,
-    ) -> Option<Domain<String>> {
-        let found: Option<String> = redis
-            .get(format!("plot:{}:instance", plot_id))
-            .await
-            .expect("redis shouldn't fail");
-        return if let Some(instance) = found {
-            Some(
-                Domain::try_from_bytes(instance, &ASCII_LOWERCASE)
-                    .expect("All items in redis should be valid"),
-            )
-        } else {
-            let row = query_as!(
-                PlotRow,
-                "SELECT id, owner_uuid, instance FROM plot
-            WHERE id = $1;",
-                plot_id
-            )
-            .fetch_optional(pg)
-            .await
-            .expect("db shouldn't fail");
-            if let Some(row) = row {
-                let instance_str = row.instance.clone().unwrap_or(instance_domain.to_string());
-                let _: () = redis
-                    .set(format!("plot:{}:instance", plot_id), &instance_str)
-                    .await
-                    .expect("redis shouldn't fail");
-                let instance = match row.instance {
-                    Some(instance) => Domain::try_from_bytes(instance, &ASCII_LOWERCASE)
-                        .expect("db should contain valid domains"),
-                    None => instance_domain.clone(),
-                };
-                Some(instance)
-            } else {
-                None
-            }
-        };
-    }
-}
-
-struct PlotValue {
-    owner: Uuid,
-    instance: Option<String>,
 }
 
 #[derive(ApiResponse)]
 enum ReplaceInstanceResult {
+    /// Plot not found
+    #[oai(status = 404)]
+    PlotNotFound,
+    /// Domain is not another active dftools server
     #[oai(status = 400)]
     InvalidDomain,
+    /// Success
     #[oai(status = 200)]
     Success,
 }
@@ -248,30 +153,30 @@ enum RegisterResult {
     /// Try again until mojang servers cooperate
     #[oai(status = 500)]
     CannotFetchUuid,
+    /// Domain is not another active dftools server
     #[oai(status = 400)]
     InvalidDomain,
+    /// Plot already registered
     #[oai(status = 409)]
-    UserAlreadyExists,
+    PlotAlreadyExists,
+    /// Success
     #[oai(status = 200)]
     Success,
 }
 
-#[derive(Deserialize)]
-struct MojangResponse {
-    id: Uuid,
-}
-
 #[derive(Object)]
 struct Instance {
-    name: Option<String>,
+    instance: Option<String>,
 }
 
 #[derive(ApiResponse)]
 enum PlotFetchResult {
+    /// Success
+    #[oai(status = 200)]
+    Ok(Json<Option<String>>),
+    /// Plot not found
     #[oai(status = 404)]
     NotFound,
-    #[oai(status = 200)]
-    Ok(Json<String>),
 }
 
 #[derive(Object)]
@@ -279,10 +184,4 @@ pub struct PlotResponse {
     plot: PlotId,
     owner: String,
     instance: String,
-}
-
-pub struct PlotRow {
-    id: i32,
-    owner_uuid: Uuid,
-    instance: Option<String>,
 }

@@ -1,7 +1,7 @@
 use std::net::{Ipv4Addr, SocketAddr};
 
 use poem::{error::ResponseError, Request};
-use poem_openapi::{auth::ApiKey, ApiResponse, SecurityScheme};
+use poem_openapi::{auth::ApiKey, SecurityScheme};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
@@ -72,7 +72,7 @@ enum ApiCheckError {
 
 impl ResponseError for ApiCheckError {
     fn status(&self) -> reqwest::StatusCode {
-        return StatusCode::UNAUTHORIZED;
+        StatusCode::UNAUTHORIZED
     }
 }
 

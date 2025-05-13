@@ -1,17 +1,16 @@
-use ascii_domain::{char_set::ASCII_LOWERCASE, dom::Domain};
-use futures::{stream, FutureExt, StreamExt};
+use futures::{stream, StreamExt};
 use poem_openapi::{
     payload::{Json, PlainText},
     ApiResponse, OpenApi,
 };
-use redis::{aio::MultiplexedConnection, AsyncCommands};
-use sqlx::{query_as, Pool, Postgres};
+use tracing::info;
 
-use super::{instance::InstanceApi, PlotAuth, PlotId};
+use crate::store::Store;
+
+use super::{PlotAuth, PlotId};
 
 pub struct BatonApi {
-    pub pg: Pool<Postgres>,
-    pub redis: MultiplexedConnection,
+    pub store: Store,
 }
 
 #[OpenApi]
@@ -24,27 +23,31 @@ impl BatonApi {
 
     #[oai(path = "/trusted", method = "get")]
     async fn get_trusted(&self, auth: PlotAuth) -> Json<Vec<PlotId>> {
-        Json(Self::fetch_plot_trust(auth.0.plot_id, &self.pg, self.redis.clone()).await)
+        Json(
+            self.store
+                .fetch_plot_trust(auth.0.plot_id)
+                .await
+                .expect("Store ops shouldn't fail"),
+        )
     }
 
     #[oai(path = "/trusted", method = "post")]
     async fn set_trusted(&self, auth: PlotAuth, trusted: Json<Vec<PlotId>>) -> SetTrustedResult {
-        let errors: Vec<_> = stream::iter(trusted.0)
-            .filter(|id| {
-                let domain = Domain::try_from_bytes("oops".to_string(), &ASCII_LOWERCASE).unwrap();
-                // FIXME: Error lol
-                InstanceApi::find_plot_instance(
-                    &self.pg,
-                    self.redis.clone(),
-                    *id,
-                    &domain
-                )
-                .map(|it| it.is_some())
-            })
-            .collect()
+        async fn plot_not_exists(store: &Store, id: PlotId) -> Option<PlotId> {
+            if store.plot_exists(id).await.expect("plot_exists shouldn't fail") {
+                None
+            } else {
+                Some(id)
+            }
+        }
+        let errors = stream::iter(&trusted.0)
+            .filter_map(|id| plot_not_exists(&self.store, *id))
+            .collect::<Vec<_>>()
             .await;
 
         if errors.is_empty() {
+            // TODO: Implement updating
+            info!("Set plot trust to {:?}", trusted.0);
             SetTrustedResult::Success
         } else {
             SetTrustedResult::PlotNotRegistered(Json(errors))
@@ -52,43 +55,7 @@ impl BatonApi {
     }
 }
 
-impl BatonApi {
-    async fn fetch_plot_trust(
-        plot: PlotId,
-        pg: &Pool<Postgres>,
-        mut redis: MultiplexedConnection,
-    ) -> Vec<PlotId> {
-        let attempt: Option<Vec<PlotId>> = redis
-            .get(format!("plot:{}:baton_trust", plot))
-            .await
-            .expect("redis shouldnt fail");
-
-        if let Some(trusts) = attempt {
-            trusts
-        } else {
-            struct TrustRow {
-                trusted: PlotId,
-            }
-            let trusts: Vec<PlotId> = query_as!(
-                TrustRow,
-                "SELECT trusted FROM baton_trust WHERE plot = $1;",
-                plot
-            )
-            .fetch_all(pg)
-            .await
-            .expect("db shouldn't fail")
-            .into_iter()
-            .map(|it| it.trusted)
-            .collect();
-
-            let _: () = redis
-                .set(format!("plot:{}:baton_trust", plot), &trusts)
-                .await
-                .expect("redis shouldn't fail");
-            trusts
-        }
-    }
-}
+impl BatonApi {}
 
 #[derive(ApiResponse)]
 enum SetTrustedResult {

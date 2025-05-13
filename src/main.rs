@@ -1,12 +1,16 @@
 use api::{baton::BatonApi, instance::InstanceApi};
-use ascii_domain::{char_set::ASCII_LOWERCASE, dom::Domain};
+use ascii_domain::{char_set::ASCII_HYPHEN_DIGITS_LOWERCASE, dom::Domain};
 use poem::{listener::TcpListener, Route};
 use poem_openapi::OpenApiService;
 use rand::distr::{Alphanumeric, SampleString};
 use serde::Deserialize;
 use sqlx::PgPool;
+use store::Store;
 
 pub mod api;
+pub mod store;
+
+const DOMAIN_SET: ascii_domain::char_set::AllowedAscii<[u8; 37]> = ASCII_HYPHEN_DIGITS_LOWERCASE;
 
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
@@ -22,19 +26,26 @@ async fn main() -> color_eyre::Result<()> {
     let pg = PgPool::connect(&config.database_url).await?;
     let client = redis::Client::open(config.redis_url).unwrap();
     let redis = client.get_multiplexed_async_connection().await?;
+    let store = Store::new(redis, pg);
 
     let instance_api_service = OpenApiService::new(
         InstanceApi {
-            pg: pg.clone(),
-            redis: redis.clone(),
-            instance_domain: Domain::try_from_bytes(config.domain, &ASCII_LOWERCASE),
+            store: store.clone(),
+            instance_domain: Domain::try_from_bytes(config.domain, &DOMAIN_SET)
+                .expect("Malformed domain in config"),
             self_check_key: random_key(),
         },
         "Instance API",
         "0.0.1",
     )
     .server("http://localhost:3000/instance/v0");
-    let baton_api_service = OpenApiService::new(BatonApi { pg, redis }, "Baton API", "0.0.1");
+    let baton_api_service = OpenApiService::new(
+        BatonApi {
+            store: store.clone(),
+        },
+        "Baton API",
+        "0.0.1",
+    );
 
     let app = Route::new()
         .nest("/instance/v0/docs", instance_api_service.swagger_ui())
@@ -45,6 +56,7 @@ async fn main() -> color_eyre::Result<()> {
     let _ = poem::Server::new(TcpListener::bind(format!("0.0.0.0:{}", config.port)))
         .run(app)
         .await;
+    println!("simply no");
     Ok(())
 }
 
