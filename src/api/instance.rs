@@ -6,12 +6,18 @@ use poem_openapi::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::{store::{
-    instance::{PlotEditError, RegisterError},
-    Store,
-}, DOMAIN_SET};
+use crate::{
+    store::{
+        instance::{PlotEditError, RegisterError},
+        Store,
+    },
+    DOMAIN_SET,
+};
 
-use super::{PlotAuth, PlotId};
+use super::{
+    auth::{Auth, PlotAuth},
+    PlotId,
+};
 
 pub struct InstanceApi {
     pub store: Store,
@@ -45,6 +51,11 @@ impl InstanceApi {
         VibeCheckResult::Passed
     }
 
+    #[oai(path = "/whoami", method = "get")]
+    async fn whoami(&self, auth: Auth) -> Json<PlotId> {
+        Json(auth.plot_id())
+    }
+
     #[oai(path = "/plot", method = "get")]
     async fn get_plot_instance(&self, id: Query<PlotId>) -> PlotFetchResult {
         if let Some(plot) = self
@@ -61,10 +72,9 @@ impl InstanceApi {
 
     #[oai(path = "/plot", method = "post")]
     async fn register(&self, instance: Json<Instance>, auth: PlotAuth) -> RegisterResult {
-        let id = auth.0.plot_id;
         let uuid = if let Some(id) = self
             .store
-            .get_uuid(auth.0.owner)
+            .get_uuid(auth.owner_name())
             .await
             .expect("Store ops shouldn't fail")
         {
@@ -84,7 +94,7 @@ impl InstanceApi {
         };
         match self
             .store
-            .register_plot(id, uuid, domain.as_ref())
+            .register_plot(auth.plot_id(), uuid, domain.as_ref())
             .await
             .expect("store shouldn't fail")
         {
@@ -100,9 +110,8 @@ impl InstanceApi {
     async fn replace_instance(
         &self,
         instance: Json<Instance>,
-        auth: PlotAuth,
+        auth: Auth,
     ) -> ReplaceInstanceResult {
-        let id = auth.0.plot_id;
         let domain = if let Some(str) = instance.instance.clone() {
             if let Ok(it) = Domain::try_from_bytes(str, &DOMAIN_SET) {
                 Some(it)
@@ -114,7 +123,7 @@ impl InstanceApi {
         };
         if let Err(err) = self
             .store
-            .edit_plot(id, domain.as_ref())
+            .edit_plot(auth.plot_id(), domain.as_ref())
             .await
             .expect("store ops shouldn't fail")
         {
@@ -125,6 +134,23 @@ impl InstanceApi {
         } else {
             ReplaceInstanceResult::Success
         }
+    }
+
+    #[oai(path = "/key", method = "post")]
+    async fn create_api_key(&self, auth: PlotAuth) -> Json<String> {
+        let key = self
+            .store
+            .create_key(auth.plot_id())
+            .await
+            .expect("store ops shouldn't fail");
+        Json(key)
+    }
+    #[oai(path = "/key", method = "delete")]
+    async fn delete_all_api_keys(&self, auth: Auth) {
+        self.store
+            .disable_all_keys(auth.plot_id())
+            .await
+            .expect("store ops shouldn't fail");
     }
 }
 

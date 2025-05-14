@@ -1,6 +1,7 @@
+
 use api::{baton::BatonApi, instance::InstanceApi};
 use ascii_domain::{char_set::ASCII_HYPHEN_DIGITS_LOWERCASE, dom::Domain};
-use poem::{listener::TcpListener, Route};
+use poem::{listener::TcpListener, EndpointExt, Route};
 use poem_openapi::OpenApiService;
 use rand::distr::{Alphanumeric, SampleString};
 use serde::Deserialize;
@@ -45,13 +46,16 @@ async fn main() -> color_eyre::Result<()> {
         },
         "Baton API",
         "0.0.1",
-    ).server("http://localhost:3000/baton/v0");
+    )
+    .server("http://localhost:3000/baton/v0");
 
     let app = Route::new()
         .nest("/instance/v0/docs", instance_api_service.swagger_ui())
         .nest("/instance/v0", instance_api_service)
         .nest("/baton/v0/docs", baton_api_service.swagger_ui())
-        .nest("/baton/v0", baton_api_service);
+        .nest("/baton/v0", baton_api_service)
+        .data(store);
+
 
     let _ = poem::Server::new(TcpListener::bind(format!("0.0.0.0:{}", config.port)))
         .run(app)

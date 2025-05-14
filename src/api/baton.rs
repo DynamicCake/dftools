@@ -1,12 +1,9 @@
 use futures::{stream, StreamExt};
-use poem_openapi::{
-    payload::{Json, PlainText},
-    ApiResponse, OpenApi,
-};
+use poem_openapi::{payload::Json, ApiResponse, OpenApi};
 
 use crate::store::Store;
 
-use super::{PlotAuth, PlotId};
+use super::{auth::Auth, PlotId};
 
 pub struct BatonApi {
     pub store: Store,
@@ -14,24 +11,18 @@ pub struct BatonApi {
 
 #[OpenApi]
 impl BatonApi {
-    /// This API returns the currently logged in user.
-    #[oai(path = "/hello", method = "get")]
-    async fn hello(&self, auth: PlotAuth) -> PlainText<String> {
-        PlainText(auth.0.plot_id.to_string())
-    }
-
     #[oai(path = "/trusted", method = "get")]
-    async fn get_trusted(&self, auth: PlotAuth) -> Json<Vec<PlotId>> {
+    async fn get_trusted(&self, auth: Auth) -> Json<Vec<PlotId>> {
         Json(
             self.store
-                .fetch_plot_trust(auth.0.plot_id)
+                .fetch_plot_trust(auth.plot_id())
                 .await
                 .expect("Store ops shouldn't fail"),
         )
     }
 
     #[oai(path = "/trusted", method = "post")]
-    async fn set_trusted(&self, auth: PlotAuth, trusted: Json<Vec<PlotId>>) -> SetTrustedResult {
+    async fn set_trusted(&self, auth: Auth, trusted: Json<Vec<PlotId>>) -> SetTrustedResult {
         async fn plot_not_exists(store: &Store, id: PlotId) -> Option<PlotId> {
             if store
                 .plot_exists(id)
@@ -51,7 +42,7 @@ impl BatonApi {
         if errors.is_empty() {
             if let Err(_err) = self
                 .store
-                .set_plot_trust(auth.0.plot_id, trusted.0)
+                .set_plot_trust(auth.plot_id(), trusted.0)
                 .await
                 .expect("Store ops shouldn't fail")
             {
