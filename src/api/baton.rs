@@ -3,7 +3,6 @@ use poem_openapi::{
     payload::{Json, PlainText},
     ApiResponse, OpenApi,
 };
-use tracing::info;
 
 use crate::store::Store;
 
@@ -34,7 +33,11 @@ impl BatonApi {
     #[oai(path = "/trusted", method = "post")]
     async fn set_trusted(&self, auth: PlotAuth, trusted: Json<Vec<PlotId>>) -> SetTrustedResult {
         async fn plot_not_exists(store: &Store, id: PlotId) -> Option<PlotId> {
-            if store.plot_exists(id).await.expect("plot_exists shouldn't fail") {
+            if store
+                .plot_exists(id)
+                .await
+                .expect("plot_exists shouldn't fail")
+            {
                 None
             } else {
                 Some(id)
@@ -46,23 +49,29 @@ impl BatonApi {
             .await;
 
         if errors.is_empty() {
-            // TODO: Implement updating
-            info!("Set plot trust to {:?}", trusted.0);
+            if let Err(_err) = self
+                .store
+                .set_plot_trust(auth.0.plot_id, trusted.0)
+                .await
+                .expect("Store ops shouldn't fail")
+            {
+                return SetTrustedResult::PlotNotFound;
+            }
             SetTrustedResult::Success
         } else {
-            SetTrustedResult::PlotNotRegistered(Json(errors))
+            SetTrustedResult::OtherPlotNotRegistered(Json(errors))
         }
     }
 }
 
-impl BatonApi {}
-
 #[derive(ApiResponse)]
 enum SetTrustedResult {
+    #[oai(status = 404)]
+    PlotNotFound,
     /// Some plots are not registered on this instance.
     /// Register these plots before trying again
-    #[oai(status = 400)]
-    PlotNotRegistered(Json<Vec<PlotId>>),
+    #[oai(status = 409)]
+    OtherPlotNotRegistered(Json<Vec<PlotId>>),
     #[oai(status = 200)]
     Success,
 }

@@ -45,7 +45,7 @@ async fn main() -> color_eyre::Result<()> {
         },
         "Baton API",
         "0.0.1",
-    );
+    ).server("http://localhost:3000/baton/v0");
 
     let app = Route::new()
         .nest("/instance/v0/docs", instance_api_service.swagger_ui())

@@ -1,4 +1,4 @@
-use ascii_domain::{char_set::ASCII_LOWERCASE, dom::Domain};
+use ascii_domain::dom::Domain;
 use redis::{aio::MultiplexedConnection, AsyncCommands};
 use redis_macros::{FromRedisValue, ToRedisArgs};
 use serde::{Deserialize, Serialize};
@@ -100,9 +100,7 @@ impl Store {
             Ok(_) => Ok(Ok(())),
             Err(kind) => match kind {
                 sqlx::Error::Database(err) => match err.kind() {
-                    sqlx::error::ErrorKind::UniqueViolation => {
-                        Ok(Err(RegisterError::PlotTaken))
-                    }
+                    sqlx::error::ErrorKind::UniqueViolation => Ok(Err(RegisterError::PlotTaken)),
                     _ => Err(err.into()),
                 },
                 err => Err(err.into()),
@@ -128,15 +126,15 @@ impl Store {
         let res = query!(
             "UPDATE plot SET
             instance = $2
-            WHERE id = $1
-            RETURNING id;",
+            WHERE id = $1",
             plot_id,
             domain
         )
-        .fetch_optional(&self.pg)
+        .execute(&self.pg)
         .await
-        .expect("db shouldn't fail");
-        if res.is_some() {
+        .expect("db shouldn't fail")
+        .rows_affected();
+        if res == 1 {
             Ok(Ok(()))
         } else {
             Ok(Err(PlotEditError::PlotNotFound))
