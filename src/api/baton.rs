@@ -1,5 +1,5 @@
 use futures::{stream, StreamExt};
-use poem_openapi::{payload::Json, ApiResponse, OpenApi};
+use poem_openapi::{param::Query, payload::Json, ApiResponse, OpenApi};
 
 use crate::store::Store;
 
@@ -15,7 +15,7 @@ impl BatonApi {
     async fn get_trusted(&self, auth: Auth) -> Json<Vec<PlotId>> {
         Json(
             self.store
-                .fetch_plot_trust(auth.plot_id())
+                .fetch_plot_trust(auth.plot().plot_id)
                 .await
                 .expect("Store ops shouldn't fail"),
         )
@@ -42,7 +42,7 @@ impl BatonApi {
         if errors.is_empty() {
             if let Err(_err) = self
                 .store
-                .set_plot_trust(auth.plot_id(), trusted.0)
+                .set_plot_trust(auth.plot().plot_id, trusted.0)
                 .await
                 .expect("Store ops shouldn't fail")
             {
@@ -53,6 +53,20 @@ impl BatonApi {
             SetTrustedResult::OtherPlotNotRegistered(Json(errors))
         }
     }
+    #[oai(path = "/transfer", method = "post")]
+    async fn transfer(&self, plot_id: Query<PlotId>) {
+        self.store.get_plot(plot_id.0).await.expect("");
+    }
+
+    /*
+    {
+        "plot_origin": 41808, // The plot id that sent the transfer
+        "time_set": 1743544800, // The time the plot claimed to send the transfer
+        "data": { // Payload (DFJSON)
+            "id": "str",
+            "val": "Hello world!"
+        }
+        */
 }
 
 #[derive(ApiResponse)]

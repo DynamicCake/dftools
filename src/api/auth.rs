@@ -1,16 +1,51 @@
 use std::net::{Ipv4Addr, SocketAddr};
 
 use poem::{error::ResponseError, Request};
-use poem_openapi::{auth::ApiKey, Object, SecurityScheme};
+use poem_openapi::{auth::ApiKey,  SecurityScheme};
 use redis_macros::{FromRedisValue, ToRedisArgs};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
 use uuid::Uuid;
 
-use crate::store::Store;
+use crate::{instance::Instance, store::Store};
 
 use super::PlotId;
+
+pub struct UnregisteredPlot {
+    pub plot_id: PlotId,
+    pub owner: String,
+}
+
+#[derive(SecurityScheme)]
+#[oai(
+    ty = "api_key",
+    key_name = "User-Agent",
+    key_in = "header",
+    checker = "check_unreg_plot"
+)]
+pub struct UnregisteredAuth(pub UnregisteredPlot);
+
+pub async fn check_unreg_plot(req: &Request, user_agent: ApiKey) -> poem::Result<UnregisteredPlot> {
+    let addr = req
+        .remote_addr()
+        .as_socket_addr()
+        .ok_or(PlotAuthError::NotInternetSocketAddr)?;
+    let remote_addr = match *addr {
+        SocketAddr::V4(addr) => addr,
+        SocketAddr::V6(_) => return Err(PlotAuthError::NotIpv4.into()),
+    };
+    if !DF_IPS.contains(remote_addr.ip()) {
+        info!("Denied ip {}", req.remote_addr());
+        return Err(PlotAuthError::InvalidIp.into());
+    }
+    if let Some(plot) = parse_user_agent(&user_agent.key) {
+        Ok(plot)
+    } else {
+        error!("Malformed user agent {}", user_agent.key);
+        Err(PlotAuthError::MalformedUserAgent.into())
+    }
+}
 
 #[derive(SecurityScheme)]
 pub enum Auth {
@@ -19,10 +54,10 @@ pub enum Auth {
 }
 
 impl Auth {
-    pub fn plot_id(&self) -> PlotId {
+    pub fn plot(self) -> Plot {
         match self {
-            Auth::KeyAuth(a) => a.plot_id(),
-            Auth::PlotAuth(a) => a.plot_id(),
+            Auth::KeyAuth(a) => a.0,
+            Auth::PlotAuth(a) => a.0,
         }
     }
 }
@@ -30,10 +65,11 @@ impl Auth {
 // key auth
 
 /// Guaranteed to be registered
-#[derive(Debug, Serialize, Deserialize, ToRedisArgs, FromRedisValue, Object)]
-pub struct UuidPlot {
+#[derive(Debug, Serialize, Deserialize, ToRedisArgs, FromRedisValue)]
+pub struct Plot {
     pub plot_id: PlotId,
     pub owner: Uuid,
+    pub instance: Instance,
 }
 
 #[derive(SecurityScheme)]
@@ -43,19 +79,9 @@ pub struct UuidPlot {
     key_in = "header",
     checker = "key_checker"
 )]
-pub struct KeyAuth(UuidPlot);
-impl KeyAuth {
-    #[inline]
-    pub fn plot_id(&self) -> PlotId {
-        self.0.plot_id
-    }
-    #[inline]
-    pub fn owner_uuid(&self) -> Uuid {
-        self.0.owner
-    }
-}
+pub struct KeyAuth(pub Plot);
 
-async fn key_checker(req: &Request, auth: ApiKey) -> poem::Result<UuidPlot> {
+async fn key_checker(req: &Request, auth: ApiKey) -> poem::Result<Plot> {
     let store: &Store = req.data().expect("Store should be there");
     Ok(store
         .verify_key(&auth.key)
@@ -78,31 +104,15 @@ impl ResponseError for KeyAuthError {
 
 // plot auth
 
-#[derive(Debug, Serialize, Deserialize, Object)]
-pub struct NamePlot {
-    pub plot_id: PlotId,
-    pub owner: String,
-}
-
 /// Plot authorization
 #[derive(SecurityScheme)]
 #[oai(
     ty = "api_key",
     key_name = "User-Agent",
     key_in = "header",
-    checker = "api_checker"
+    checker = "plot_checker"
 )]
-pub struct PlotAuth(NamePlot);
-impl PlotAuth {
-    #[inline]
-    pub fn plot_id(&self) -> PlotId {
-        self.0.plot_id
-    }
-    #[inline]
-    pub fn owner_name(&self) -> &str {
-        &self.0.owner
-    }
-}
+pub struct PlotAuth(pub Plot);
 
 #[cfg(debug_assertions)]
 const DF_IPS: [Ipv4Addr; 2] = [
@@ -113,34 +123,33 @@ const DF_IPS: [Ipv4Addr; 2] = [
 #[cfg(not(debug_assertions))]
 const DF_IPS: [Ipv4Addr; 1] = [Ipv4Addr::new(51, 222, 245, 229)];
 
-async fn api_checker(req: &Request, user_agent: ApiKey) -> poem::Result<NamePlot> {
-    let addr = req
-        .remote_addr()
-        .as_socket_addr()
-        .ok_or(PlotAuthError::NotInternetSocketAddr)?;
-    let remote_addr = match *addr {
-        SocketAddr::V4(addr) => addr,
-        SocketAddr::V6(_) => return Err(PlotAuthError::NotIpv4.into()),
-    };
-    if !DF_IPS.contains(remote_addr.ip()) {
-        info!("Denied ip {}", req.remote_addr());
-        return Err(PlotAuthError::InvalidIp.into());
-    }
-    if let Some(plot) = parse_user_agent(&user_agent.key) {
-        Ok(plot)
-    } else {
-        error!("Malformed user agent {}", user_agent.key);
-        Err(PlotAuthError::MalformedUserAgent.into())
-    }
+async fn plot_checker(req: &Request, user_agent: ApiKey) -> poem::Result<Plot> {
+    let unreg = check_unreg_plot(req, user_agent).await?;
+    let store: &Store = req.data().expect("Server should have store");
+    let plot = store
+        .get_plot(unreg.plot_id)
+        .await
+        .expect("Cannot get plot")
+        .ok_or(PlotAuthError::PlotNotRegistered)?;
+    Ok(Plot {
+        plot_id: unreg.plot_id,
+        owner: plot.owner,
+        instance: plot.instance,
+    })
 }
 
 #[derive(Debug, thiserror::Error)]
 enum PlotAuthError {
-    #[error("Must be socket error")]
+    #[error("Plot not registered")]
+    PlotNotRegistered,
+    #[error("Must be socket error for plot auth")]
     NotInternetSocketAddr,
-    #[error("Must be ipv4")]
+    #[error("Must be ipv4 for plot auth")]
     NotIpv4,
-    #[error("Ip doesn't match ips: {:?}\nDid you mean to use X-API-Key auth?", DF_IPS)]
+    #[error(
+        "Ip doesn't match ips: {:?}\nDid you mean to use X-API-Key auth?",
+        DF_IPS
+    )]
     InvalidIp,
     #[error("Malfored User-Agent")]
     MalformedUserAgent,
@@ -152,7 +161,7 @@ impl ResponseError for PlotAuthError {
     }
 }
 
-fn parse_user_agent(header: &str) -> Option<NamePlot> {
+fn parse_user_agent(header: &str) -> Option<UnregisteredPlot> {
     // Hypercube/7.2 (23612, DynamicCake)
     //
     let start = "Hypercube/7.2 (";
@@ -163,7 +172,7 @@ fn parse_user_agent(header: &str) -> Option<NamePlot> {
     let (plot_id, username) = right.split_once(", ")?;
     let (username, _) = username.split_once(")")?;
     let plot_id: PlotId = plot_id.parse().ok()?;
-    Some(NamePlot {
+    Some(UnregisteredPlot {
         plot_id,
         owner: username.to_string(),
     })

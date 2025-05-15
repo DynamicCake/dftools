@@ -1,5 +1,4 @@
 use base64::{prelude::BASE64_STANDARD, Engine};
-use futures::{stream, StreamExt};
 use rand::distr::{Alphanumeric, SampleString};
 use redis::{aio::MultiplexedConnection, AsyncCommands};
 use serde::Deserialize;
@@ -8,7 +7,7 @@ use sqlx::{query, query_as, Pool, Postgres};
 use tracing::info;
 use uuid::Uuid;
 
-use crate::api::{auth::UuidPlot, PlotId};
+use crate::api::{auth::Plot, PlotId};
 
 pub mod baton;
 pub mod instance;
@@ -22,19 +21,16 @@ pub struct Store {
 pub struct KeyRow {
     plot: PlotId,
     owner_uuid: Uuid,
+    instance: Option<String>,
 }
 
 /// Misc
 impl Store {
-    pub async fn verify_key(&self, key: &str) -> color_eyre::Result<Option<UuidPlot>> {
+    pub async fn verify_key(&self, key: &str) -> color_eyre::Result<Option<Plot>> {
         let mut redis = self.redis.clone();
-        let res: Option<UuidPlot> = redis.get(format!("key:{key}")).await?;
+        let res: Option<Plot> = redis.get(format!("key:{key}")).await?;
         if let Some(plot) = res {
-            return Ok(if plot.plot_id == -1 {
-                None
-            } else {
-                Some(plot)
-            });
+            return Ok(if plot.plot_id == -1 { None } else { Some(plot) });
         }
 
         let plot = query_as!(
@@ -42,7 +38,8 @@ impl Store {
             "
             SELECT
                 ak.plot,
-                p.owner_uuid
+                p.owner_uuid,
+                p.instance
             FROM
                 api_key ak
             JOIN
@@ -58,9 +55,10 @@ impl Store {
 
         let key = BASE64_STANDARD.encode(Sha256::digest(key));
         if let Some(plot) = plot {
-            let uuid_plot = UuidPlot {
+            let uuid_plot = Plot {
                 plot_id: plot.plot,
                 owner: plot.owner_uuid,
+                instance: plot.instance.try_into()?,
             };
             let _: () = redis.set(format!("key:{}", key), &uuid_plot).await?;
             Ok(Some(uuid_plot))
@@ -68,9 +66,11 @@ impl Store {
             let _: () = redis
                 .set(
                     format!("key:{}", key),
-                    UuidPlot {
+                    // Yes... magic values due to redis
+                    Plot {
                         plot_id: -1,
-                        owner: Uuid::from_u128(0)
+                        owner: Uuid::from_u128(0),
+                        instance: None.try_into()?
                     },
                 )
                 .await?;

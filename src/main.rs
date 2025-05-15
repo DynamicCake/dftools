@@ -9,6 +9,7 @@ use sqlx::PgPool;
 use store::Store;
 
 pub mod api;
+pub mod instance;
 pub mod store;
 
 const DOMAIN_SET: ascii_domain::char_set::AllowedAscii<[u8; 37]> = ASCII_HYPHEN_DIGITS_LOWERCASE;

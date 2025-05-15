@@ -7,15 +7,14 @@ use poem_openapi::{
 use sha2::{Digest, Sha256};
 
 use crate::{
-    store::{
+    instance::Instance, store::{
         instance::{PlotEditError, RegisterError},
         Store,
-    },
-    DOMAIN_SET,
+    }
 };
 
 use super::{
-    auth::{Auth, PlotAuth},
+    auth::{Auth, PlotAuth, UnregisteredAuth},
     PlotId,
 };
 
@@ -53,28 +52,29 @@ impl InstanceApi {
 
     #[oai(path = "/whoami", method = "get")]
     async fn whoami(&self, auth: Auth) -> Json<PlotId> {
-        Json(auth.plot_id())
+        Json(auth.plot().plot_id)
     }
 
     #[oai(path = "/plot", method = "get")]
     async fn get_plot_instance(&self, id: Query<PlotId>) -> PlotFetchResult {
         if let Some(plot) = self
             .store
-            .find_plot(id.0)
+            .get_plot(id.0)
             .await
             .expect("Store ops shouldn't fail")
         {
-            PlotFetchResult::Ok(Json(plot.instance.map(|it| it.to_string())))
+            PlotFetchResult::Ok(Json(plot.instance.into()))
         } else {
             PlotFetchResult::NotFound
         }
     }
 
     #[oai(path = "/plot", method = "post")]
-    async fn register(&self, instance: Json<Instance>, auth: PlotAuth) -> RegisterResult {
+    async fn register(&self, instance: Json<String>, auth: UnregisteredAuth) -> RegisterResult {
+        let plot = auth.0;
         let uuid = if let Some(id) = self
             .store
-            .get_uuid(auth.owner_name())
+            .get_uuid(&plot.owner)
             .await
             .expect("Store ops shouldn't fail")
         {
@@ -83,24 +83,20 @@ impl InstanceApi {
             return RegisterResult::CannotFetchUuid;
         };
 
-        let domain = if let Some(str) = instance.instance.clone() {
-            if let Ok(it) = Domain::try_from_bytes(str, &DOMAIN_SET) {
-                Some(it)
-            } else {
-                return RegisterResult::InvalidDomain;
-            }
+        let domain = if let Ok(str) = instance.0.try_into() {
+            str
         } else {
-            None
+            return RegisterResult::InvalidDomain;
         };
         match self
             .store
-            .register_plot(auth.plot_id(), uuid, domain.as_ref())
+            .register_plot(plot.plot_id, uuid, &domain)
             .await
             .expect("store shouldn't fail")
         {
             Ok(_) => RegisterResult::Success,
             Err(err) => match err {
-                RegisterError::InvalidDomain => RegisterResult::InvalidDomain,
+                RegisterError::DomainCheckFailed => RegisterResult::InvalidDomain,
                 RegisterError::PlotTaken => RegisterResult::PlotAlreadyExists,
             },
         }
@@ -109,21 +105,17 @@ impl InstanceApi {
     #[oai(path = "/plot", method = "put")]
     async fn replace_instance(
         &self,
-        instance: Json<Instance>,
+        instance: Json<String>,
         auth: Auth,
     ) -> ReplaceInstanceResult {
-        let domain = if let Some(str) = instance.instance.clone() {
-            if let Ok(it) = Domain::try_from_bytes(str, &DOMAIN_SET) {
-                Some(it)
-            } else {
-                return ReplaceInstanceResult::InvalidDomain;
-            }
+        let domain: Instance = if let Ok(str) = instance.0.try_into() {
+            str
         } else {
-            None
+            return ReplaceInstanceResult::InvalidDomain;
         };
         if let Err(err) = self
             .store
-            .edit_plot(auth.plot_id(), domain.as_ref())
+            .edit_plot(auth.plot().plot_id, &domain)
             .await
             .expect("store ops shouldn't fail")
         {
@@ -140,7 +132,7 @@ impl InstanceApi {
     async fn create_api_key(&self, auth: PlotAuth) -> Json<String> {
         let key = self
             .store
-            .create_key(auth.plot_id())
+            .create_key(auth.0.plot_id)
             .await
             .expect("store ops shouldn't fail");
         Json(key)
@@ -148,7 +140,7 @@ impl InstanceApi {
     #[oai(path = "/key", method = "delete")]
     async fn delete_all_api_keys(&self, auth: Auth) {
         self.store
-            .disable_all_keys(auth.plot_id())
+            .disable_all_keys(auth.plot().plot_id)
             .await
             .expect("store ops shouldn't fail");
     }
@@ -188,11 +180,6 @@ enum RegisterResult {
     /// Success
     #[oai(status = 200)]
     Success,
-}
-
-#[derive(Object)]
-struct Instance {
-    instance: Option<String>,
 }
 
 #[derive(ApiResponse)]

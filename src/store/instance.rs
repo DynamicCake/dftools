@@ -1,11 +1,10 @@
-use ascii_domain::dom::Domain;
 use redis::{aio::MultiplexedConnection, AsyncCommands};
 use redis_macros::{FromRedisValue, ToRedisArgs};
 use serde::{Deserialize, Serialize};
 use sqlx::{query, query_as, Pool, Postgres};
 use uuid::Uuid;
 
-use crate::{api::PlotId, DOMAIN_SET};
+use crate::{api::PlotId, instance::Instance};
 
 use super::Store;
 
@@ -25,7 +24,7 @@ impl Store {
         }
     }
 
-    pub async fn find_plot(&self, plot_id: PlotId) -> color_eyre::Result<Option<PlotValue>> {
+    pub async fn get_plot(&self, plot_id: PlotId) -> color_eyre::Result<Option<PlotValue>> {
         let mut redis = self.redis.clone();
         let found: Option<PlotValue> = redis.get(format!("plot:{}", plot_id)).await?;
 
@@ -46,12 +45,7 @@ impl Store {
         .fetch_optional(&self.pg)
         .await?;
         Ok(if let Some(row) = row {
-            let instance = {
-                match row.instance {
-                    Some(inst) => Some(Domain::try_from_bytes(inst, &DOMAIN_SET)?),
-                    None => None,
-                }
-            };
+            let instance: Instance = row.instance.try_into()?;
             let value = PlotValue {
                 owner: row.owner_uuid,
                 instance,
@@ -73,21 +67,18 @@ impl Store {
 
     /// You are supposed to unwrap the eyre result, which is almost always ok,
     /// and handle the inner Result
-    pub async fn register_plot<T: AsRef<str>>(
+    pub async fn register_plot(
         &self,
         plot_id: PlotId,
         uuid: Uuid,
-        name: Option<&Domain<T>>,
+        instance: &Instance,
     ) -> color_eyre::Result<Result<(), RegisterError>> {
-        if let Some(name) = name {
-            let vibes = self.domain_vibe_check(name.into()).await;
-            if !vibes {
-                return Ok(Err(RegisterError::InvalidDomain));
-            }
+        if !instance.vibe_check().await {
+            return Ok(Err(RegisterError::DomainCheckFailed));
         }
 
         self.invalidate_plot_cache(plot_id).await?;
-        let str = name.map(|domain| domain.as_inner().as_ref().to_owned());
+        let str: Option<&String> = instance.into();
         match query!(
             "INSERT INTO plot (id, owner_uuid, instance) VALUES ($1, $2, $3)",
             plot_id,
@@ -109,20 +100,17 @@ impl Store {
     }
     /// If result is Ok(true) it means success,
     /// Ok(false) means the instance didn't pass the vibe check
-    pub async fn edit_plot<T: AsRef<str>>(
+    pub async fn edit_plot(
         &self,
         plot_id: PlotId,
-        instance_domain: Option<&Domain<T>>,
+        instance_domain: &Instance,
     ) -> color_eyre::Result<Result<(), PlotEditError>> {
-        if let Some(name) = instance_domain {
-            let vibes = self.domain_vibe_check(name.into()).await;
-            if !vibes {
-                return Ok(Err(PlotEditError::InvalidDomain));
-            }
+        if !instance_domain.vibe_check().await {
+            return Ok(Err(PlotEditError::InvalidDomain));
         }
 
         self.invalidate_plot_cache(plot_id).await?;
-        let domain = instance_domain.map(|domain| domain.as_inner().as_ref().to_owned());
+        let domain: Option<&String> = instance_domain.into();
         let res = query!(
             "UPDATE plot SET
             instance = $2
@@ -148,16 +136,12 @@ impl Store {
         let _: () = redis.del(format!("plot:{}:baton_trust", plot_id)).await?;
         Ok(())
     }
-    async fn domain_vibe_check<T: AsRef<str>>(&self, _domain: Domain<T>) -> bool {
-        // TODO: Implmeent domain vibe check
-        true
-    }
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum RegisterError {
-    #[error("Invalid domain")]
-    InvalidDomain,
+    #[error("Domain check failed")]
+    DomainCheckFailed,
     #[error("Plot is already registered")]
     PlotTaken,
 }
@@ -173,7 +157,7 @@ pub enum PlotEditError {
 #[derive(Serialize, Deserialize, FromRedisValue, ToRedisArgs, Clone)]
 pub struct PlotValue {
     pub owner: Uuid,
-    pub instance: Option<Domain<String>>,
+    pub instance: Instance,
 }
 
 #[allow(dead_code)]
