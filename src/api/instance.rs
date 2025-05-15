@@ -1,16 +1,15 @@
 use ascii_domain::dom::Domain;
 use poem_openapi::{
-    param::Query,
-    payload::{Json, PlainText},
-    ApiResponse, Object, OpenApi,
+    param::Query, payload::{Json, PlainText}, types::Example, ApiResponse, Object, OpenApi
 };
 use sha2::{Digest, Sha256};
 
 use crate::{
-    instance::Instance, store::{
+    instance::Instance,
+    store::{
         instance::{PlotEditError, RegisterError},
         Store,
-    }
+    },
 };
 
 use super::{
@@ -36,7 +35,11 @@ pub enum VibeCheckResult {
 
 #[OpenApi]
 impl InstanceApi {
-    #[oai(path = "/vibecheck", method = "get")]
+    /// Give the server a vibe check
+    ///
+    /// If you are another instance, call this endpoint to get info on this server.
+    /// To verify that the config domain is you own domain, hit this endpoint with your self check key.
+    #[oai(path = "/ping", method = "get")]
     async fn vibecheck(&self, key: Query<Option<String>>) -> VibeCheckResult {
         if let Some(key) = key.0 {
             let hash: [u8; 32] = Sha256::digest(key).into();
@@ -50,16 +53,18 @@ impl InstanceApi {
         VibeCheckResult::Passed
     }
 
+    /// Get the plot id
     #[oai(path = "/whoami", method = "get")]
     async fn whoami(&self, auth: Auth) -> Json<PlotId> {
         Json(auth.plot().plot_id)
     }
 
+    /// Get the plot's instance domain
     #[oai(path = "/plot", method = "get")]
     async fn get_plot_instance(&self, id: Query<PlotId>) -> PlotFetchResult {
         if let Some(plot) = self
             .store
-            .get_plot(id.0)
+            .get_plot_instance(id.0)
             .await
             .expect("Store ops shouldn't fail")
         {
@@ -69,8 +74,11 @@ impl InstanceApi {
         }
     }
 
+    /// Register the plot to an instance
+    ///
+    /// Leave the body blank to register to this instance
     #[oai(path = "/plot", method = "post")]
-    async fn register(&self, instance: Json<String>, auth: UnregisteredAuth) -> RegisterResult {
+    async fn register(&self, instance: PlainText<String>, auth: UnregisteredAuth) -> RegisterResult {
         let plot = auth.0;
         let uuid = if let Some(id) = self
             .store
@@ -94,7 +102,7 @@ impl InstanceApi {
             .await
             .expect("store shouldn't fail")
         {
-            Ok(_) => RegisterResult::Success,
+            Ok(_) => RegisterResult::Ok,
             Err(err) => match err {
                 RegisterError::DomainCheckFailed => RegisterResult::InvalidDomain,
                 RegisterError::PlotTaken => RegisterResult::PlotAlreadyExists,
@@ -102,12 +110,9 @@ impl InstanceApi {
         }
     }
 
+    /// Change the plot instance
     #[oai(path = "/plot", method = "put")]
-    async fn replace_instance(
-        &self,
-        instance: Json<String>,
-        auth: Auth,
-    ) -> ReplaceInstanceResult {
+    async fn replace_instance(&self, instance: Json<String>, auth: Auth) -> ReplaceInstanceResult {
         let domain: Instance = if let Ok(str) = instance.0.try_into() {
             str
         } else {
@@ -128,6 +133,7 @@ impl InstanceApi {
         }
     }
 
+    /// Create an api key
     #[oai(path = "/key", method = "post")]
     async fn create_api_key(&self, auth: PlotAuth) -> Json<String> {
         let key = self
@@ -137,6 +143,7 @@ impl InstanceApi {
             .expect("store ops shouldn't fail");
         Json(key)
     }
+    /// Purge all api keys
     #[oai(path = "/key", method = "delete")]
     async fn delete_all_api_keys(&self, auth: Auth) {
         self.store
@@ -153,7 +160,7 @@ impl InstanceApi {
     }
 }
 
-#[derive(ApiResponse)]
+#[derive(ApiResponse )]
 enum ReplaceInstanceResult {
     /// Plot not found
     #[oai(status = 404)]
@@ -177,14 +184,14 @@ enum RegisterResult {
     /// Plot already registered
     #[oai(status = 409)]
     PlotAlreadyExists,
-    /// Success
+    /// Ok
     #[oai(status = 200)]
-    Success,
+    Ok,
 }
 
 #[derive(ApiResponse)]
 enum PlotFetchResult {
-    /// Success
+    /// Ok
     #[oai(status = 200)]
     Ok(Json<Option<String>>),
     /// Plot not found

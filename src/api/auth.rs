@@ -127,7 +127,7 @@ async fn plot_checker(req: &Request, user_agent: ApiKey) -> poem::Result<Plot> {
     let unreg = check_unreg_plot(req, user_agent).await?;
     let store: &Store = req.data().expect("Server should have store");
     let plot = store
-        .get_plot(unreg.plot_id)
+        .get_plot_instance(unreg.plot_id)
         .await
         .expect("Cannot get plot")
         .ok_or(PlotAuthError::PlotNotRegistered)?;

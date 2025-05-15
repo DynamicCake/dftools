@@ -13,8 +13,7 @@ impl TryFrom<String> for Instance {
     type Error = DomainErr;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
-        let domain = Domain::try_from_bytes(value, &ASCII_HYPHEN_DIGITS_LOWERCASE)?;
-        Ok(Instance(Some(domain)))
+        Self::convert(value)
     }
 }
 
@@ -53,5 +52,12 @@ impl Instance {
     pub async fn vibe_check(&self) -> bool {
         // TODO: Implment vibe check
         true
+    }
+    fn convert(str: String) -> Result<Self, DomainErr> {
+        if str.is_empty() {
+            return Ok(Instance(None))
+        }
+        let domain = Domain::try_from_bytes(str, &ASCII_HYPHEN_DIGITS_LOWERCASE)?;
+        Ok(Instance(Some(domain)))
     }
 }

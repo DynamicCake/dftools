@@ -24,7 +24,7 @@ impl Store {
         }
     }
 
-    pub async fn get_plot(&self, plot_id: PlotId) -> color_eyre::Result<Option<PlotValue>> {
+    pub async fn get_plot_instance(&self, plot_id: PlotId) -> color_eyre::Result<Option<PlotValue>> {
         let mut redis = self.redis.clone();
         let found: Option<PlotValue> = redis.get(format!("plot:{}", plot_id)).await?;
 

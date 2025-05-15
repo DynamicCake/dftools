@@ -11,6 +11,7 @@ pub struct BatonApi {
 
 #[OpenApi]
 impl BatonApi {
+    /// List trusted plots that can set transfer
     #[oai(path = "/trusted", method = "get")]
     async fn get_trusted(&self, auth: Auth) -> Json<Vec<PlotId>> {
         Json(
@@ -21,6 +22,7 @@ impl BatonApi {
         )
     }
 
+    /// Replace all trusted plots 
     #[oai(path = "/trusted", method = "post")]
     async fn set_trusted(&self, auth: Auth, trusted: Json<Vec<PlotId>>) -> SetTrustedResult {
         async fn plot_not_exists(store: &Store, id: PlotId) -> Option<PlotId> {
@@ -53,9 +55,11 @@ impl BatonApi {
             SetTrustedResult::OtherPlotNotRegistered(Json(errors))
         }
     }
+
+    /// TODO: Finish making this function lol
     #[oai(path = "/transfer", method = "post")]
     async fn transfer(&self, plot_id: Query<PlotId>) {
-        self.store.get_plot(plot_id.0).await.expect("");
+        self.store.get_plot_instance(plot_id.0).await.expect("");
     }
 
     /*
