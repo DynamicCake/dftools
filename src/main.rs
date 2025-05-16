@@ -1,18 +1,21 @@
-
 use api::{baton::BatonApi, instance::InstanceApi};
 use ascii_domain::{char_set::ASCII_HYPHEN_DIGITS_LOWERCASE, dom::Domain};
+use dfjson::DfJson;
 use poem::{listener::TcpListener, EndpointExt, Route};
 use poem_openapi::OpenApiService;
 use rand::distr::{Alphanumeric, SampleString};
+use schemars::schema_for;
 use serde::Deserialize;
 use sqlx::PgPool;
 use store::Store;
 
 pub mod api;
+pub mod dfjson;
 pub mod instance;
 pub mod store;
 
 const DOMAIN_SET: ascii_domain::char_set::AllowedAscii<[u8; 37]> = ASCII_HYPHEN_DIGITS_LOWERCASE;
+
 
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
@@ -57,7 +60,6 @@ async fn main() -> color_eyre::Result<()> {
         .nest("/baton/v0", baton_api_service)
         .data(store);
 
-
     let _ = poem::Server::new(TcpListener::bind(format!("0.0.0.0:{}", config.port)))
         .run(app)
         .await;
@@ -75,4 +77,8 @@ pub struct Config {
     database_url: String,
     port: u16,
     domain: String,
+}
+
+fn get_schema() -> String {
+    serde_json::to_string_pretty(&schema_for!(DfJson)).unwrap()
 }
