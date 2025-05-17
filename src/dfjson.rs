@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 
 use poem_openapi::{Object, Union};
+use redis_macros::{FromRedisValue, ToRedisArgs};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, JsonSchema, Union)]
+#[derive(Serialize, Deserialize, JsonSchema, Union, ToRedisArgs, FromRedisValue)]
 #[oai(discriminator_name = "id")]
 #[serde(tag = "id")]
 #[serde(rename_all = "snake_case")]

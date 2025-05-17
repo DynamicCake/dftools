@@ -1,16 +1,78 @@
-use std::net::{Ipv4Addr, SocketAddr};
+use std::{
+    net::{Ipv4Addr, SocketAddr},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use poem::{error::ResponseError, Request};
-use poem_openapi::{auth::ApiKey,  SecurityScheme};
+use poem_openapi::{auth::ApiKey, ApiResponse, Object, SecurityScheme};
 use redis_macros::{FromRedisValue, ToRedisArgs};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+use sqlx::prelude::FromRow;
 use tracing::{error, info};
 use uuid::Uuid;
 
-use crate::{instance::Instance, store::Store};
+use crate::{
+    instance::{Instance, SendInstance},
+    store::Store,
+};
 
 use super::PlotId;
+
+#[derive(Debug, Serialize, Deserialize, Object)]
+pub struct ExternalServer {
+    pub sub: SendInstance,
+    pub iat: u64,
+    pub exp: u64,
+    pub jti: Uuid,
+}
+
+#[derive(SecurityScheme)]
+#[oai(
+    ty = "api_key",
+    key_name = "X-Server-Key",
+    key_in = "header",
+    checker = "check_server"
+)]
+pub struct ExternalServerAuth(pub ExternalServer);
+
+const JWT_VERSION: u64 = 1747450744;
+
+pub async fn check_server(req: &Request, key: ApiKey) -> poem::Result<ExternalServer> {
+    let store = req.data::<Store>().expect("Store should here");
+    let server = store
+        .verify_jwt::<ExternalServer>(&key.key)
+        .ok_or(ServerAuthError::CannotVerify)?;
+
+    if server.iat < JWT_VERSION {
+        return Err(ServerAuthError::VersionMismatch.into());
+    }
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("Time went backwards")
+        .as_secs();
+
+    if server.exp < time {
+        return Err(ServerAuthError::Expired.into());
+    }
+    Ok(server)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ServerAuthError {
+    #[error("Cannot verify token")]
+    CannotVerify,
+    #[error("Token expired")]
+    Expired,
+    #[error("Version mismatch (please regenerate token)")]
+    VersionMismatch,
+}
+
+impl ResponseError for ServerAuthError {
+    fn status(&self) -> StatusCode {
+        StatusCode::UNAUTHORIZED
+    }
+}
 
 pub struct UnregisteredPlot {
     pub plot_id: PlotId,
@@ -65,7 +127,7 @@ impl Auth {
 // key auth
 
 /// Guaranteed to be registered
-#[derive(Debug, Serialize, Deserialize, ToRedisArgs, FromRedisValue)]
+#[derive(Debug, Serialize, Deserialize, ToRedisArgs, FromRedisValue, FromRow, Clone)]
 pub struct Plot {
     pub plot_id: PlotId,
     pub owner: Uuid,
@@ -127,7 +189,7 @@ async fn plot_checker(req: &Request, user_agent: ApiKey) -> poem::Result<Plot> {
     let unreg = check_unreg_plot(req, user_agent).await?;
     let store: &Store = req.data().expect("Server should have store");
     let plot = store
-        .get_plot_instance(unreg.plot_id)
+        .get_plot(unreg.plot_id)
         .await
         .expect("Cannot get plot")
         .ok_or(PlotAuthError::PlotNotRegistered)?;

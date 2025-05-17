@@ -1,11 +1,19 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use ascii_domain::dom::Domain;
+use base64::{prelude::BASE64_STANDARD, DecodeError, Engine};
+use ed25519_dalek::VerifyingKey;
+use jwt::{FromBase64, SignWithKey};
 use poem_openapi::{
-    param::Query, payload::{Json, PlainText}, types::Example, ApiResponse, Object, OpenApi
+    param::Query,
+    payload::{Json, PlainText},
+    ApiResponse, Object, OpenApi,
 };
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use crate::{
-    instance::Instance,
+    instance::{Instance, InstanceDomain, SendInstance},
     store::{
         instance::{PlotEditError, RegisterError},
         Store,
@@ -13,13 +21,13 @@ use crate::{
 };
 
 use super::{
-    auth::{Auth, PlotAuth, UnregisteredAuth},
+    auth::{Auth, ExternalServer, PlotAuth, UnregisteredAuth},
     PlotId,
 };
 
 pub struct InstanceApi {
     pub store: Store,
-    pub instance_domain: Domain<String>,
+    pub domain: Domain<String>,
     pub self_check_key: String,
 }
 
@@ -31,6 +39,17 @@ pub enum VibeCheckResult {
     KeyPassed(PlainText<&'static str>),
     #[oai(status = 400)]
     KeyVibecheckFailed,
+}
+
+#[derive(ApiResponse)]
+pub enum FetchTokenResponse {
+    #[oai(status = 400)]
+    InstanceParseError,
+    /// Inconsistent Keys, returned body is the actual key
+    #[oai(status = 403)]
+    InconsistentKeys(PlainText<String>),
+    #[oai(status = 200)]
+    Ok(PlainText<String>),
 }
 
 #[OpenApi]
@@ -53,22 +72,50 @@ impl InstanceApi {
         VibeCheckResult::Passed
     }
 
+    #[oai(path = "/server-token", method = "get")]
+    async fn get_server_token(&self, instance: Json<SendInstance>) -> FetchTokenResponse {
+        let pinstance = if let Ok(inst) = instance.0.parse() {
+            inst
+        } else {
+            return FetchTokenResponse::InstanceParseError;
+        };
+        let ok = self.store.ping_instance(&pinstance).await.expect("Error while verifying instance");
+        if !ok {
+            return FetchTokenResponse::InconsistentKeys()
+        }
+
+        const JWT_EXPIRY: u64 = 60 * 60 * 3;
+        let issued = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_secs();
+        let token = ExternalServer {
+            sub: instance.0,
+            iat: issued,
+            exp: issued + JWT_EXPIRY,
+            jti: Uuid::new_v4()
+        };
+        let signed = self.store.sign_jwt(&token).expect("signing failed");
+
+        FetchTokenResponse::Ok(PlainText(signed))
+    }
+
     /// Get the plot id
     #[oai(path = "/whoami", method = "get")]
     async fn whoami(&self, auth: Auth) -> Json<PlotId> {
         Json(auth.plot().plot_id)
     }
 
-    /// Get the plot's instance domain
+    /// Get the plot's instance
     #[oai(path = "/plot", method = "get")]
     async fn get_plot_instance(&self, id: Query<PlotId>) -> PlotFetchResult {
         if let Some(plot) = self
             .store
-            .get_plot_instance(id.0)
+            .get_plot(id.0)
             .await
             .expect("Store ops shouldn't fail")
         {
-            PlotFetchResult::Ok(Json(plot.instance.into()))
+            PlotFetchResult::Ok(PlainText(plot.instance.encode(&self.domain)))
         } else {
             PlotFetchResult::NotFound
         }
@@ -78,7 +125,11 @@ impl InstanceApi {
     ///
     /// Leave the body blank to register to this instance
     #[oai(path = "/plot", method = "post")]
-    async fn register(&self, instance: PlainText<String>, auth: UnregisteredAuth) -> RegisterResult {
+    async fn register(
+        &self,
+        instance_key: PlainText<String>,
+        auth: UnregisteredAuth,
+    ) -> RegisterResult {
         let plot = auth.0;
         let uuid = if let Some(id) = self
             .store
@@ -91,42 +142,46 @@ impl InstanceApi {
             return RegisterResult::CannotFetchUuid;
         };
 
-        let domain = if let Ok(str) = instance.0.try_into() {
-            str
-        } else {
-            return RegisterResult::InvalidDomain;
+        let key = match VerifyingKey::from_base64(&instance_key.0) {
+            Ok(key) => key,
+            Err(err) => return RegisterResult::InvalidKeyFormat(PlainText(err.to_string())),
         };
         match self
             .store
-            .register_plot(plot.plot_id, uuid, &domain)
+            .register_plot(plot.plot_id, uuid, &key)
             .await
             .expect("store shouldn't fail")
         {
             Ok(_) => RegisterResult::Ok,
             Err(err) => match err {
-                RegisterError::DomainCheckFailed => RegisterResult::InvalidDomain,
                 RegisterError::PlotTaken => RegisterResult::PlotAlreadyExists,
+                RegisterError::InstanceNotFound => RegisterResult::InstanceNotRegisterd,
             },
         }
     }
 
     /// Change the plot instance
     #[oai(path = "/plot", method = "put")]
-    async fn replace_instance(&self, instance: Json<String>, auth: Auth) -> ReplaceInstanceResult {
-        let domain: Instance = if let Ok(str) = instance.0.try_into() {
-            str
-        } else {
-            return ReplaceInstanceResult::InvalidDomain;
+    async fn replace_instance(
+        &self,
+        instance_key: Json<String>,
+        auth: Auth,
+    ) -> ReplaceInstanceResult {
+        let plot = auth.plot();
+
+        let key = match VerifyingKey::from_base64(&instance_key.0) {
+            Ok(key) => key,
+            Err(err) => return ReplaceInstanceResult::InvalidKeyFormat(PlainText(err.to_string())),
         };
         if let Err(err) = self
             .store
-            .edit_plot(auth.plot().plot_id, &domain)
+            .edit_plot(plot.plot_id, &key)
             .await
             .expect("store ops shouldn't fail")
         {
             match err {
-                PlotEditError::InvalidDomain => ReplaceInstanceResult::InvalidDomain,
                 PlotEditError::PlotNotFound => ReplaceInstanceResult::PlotNotFound,
+                PlotEditError::InstanceNotFound => ReplaceInstanceResult::InstanceNotRegisterd,
             }
         } else {
             ReplaceInstanceResult::Success
@@ -160,14 +215,17 @@ impl InstanceApi {
     }
 }
 
-#[derive(ApiResponse )]
+#[derive(ApiResponse)]
 enum ReplaceInstanceResult {
     /// Plot not found
     #[oai(status = 404)]
     PlotNotFound,
-    /// Domain is not another active dftools server
+    /// An instance with this key is not registered
     #[oai(status = 400)]
-    InvalidDomain,
+    InstanceNotRegisterd,
+    /// Invalid key format
+    #[oai(status = 400)]
+    InvalidKeyFormat(PlainText<String>),
     /// Success
     #[oai(status = 200)]
     Success,
@@ -178,9 +236,12 @@ enum RegisterResult {
     /// Try again until mojang servers cooperate
     #[oai(status = 500)]
     CannotFetchUuid,
-    /// Domain is not another active dftools server
+    /// An instance with this key is not registered
     #[oai(status = 400)]
-    InvalidDomain,
+    InstanceNotRegisterd,
+    /// Invalid key format
+    #[oai(status = 400)]
+    InvalidKeyFormat(PlainText<String>),
     /// Plot already registered
     #[oai(status = 409)]
     PlotAlreadyExists,
@@ -193,7 +254,7 @@ enum RegisterResult {
 enum PlotFetchResult {
     /// Ok
     #[oai(status = 200)]
-    Ok(Json<Option<String>>),
+    Ok(PlainText<String>),
     /// Plot not found
     #[oai(status = 404)]
     NotFound,

@@ -3,7 +3,7 @@ use redis_macros::{FromRedisValue, ToRedisArgs};
 use serde::{Deserialize, Serialize};
 use sqlx::{query, query_as};
 
-use crate::api::PlotId;
+use crate::{api::PlotId, dfjson::DfJson};
 
 use super::Store;
 
@@ -74,10 +74,15 @@ impl Store {
     }
 
     async fn invalidate_trust_cache(&self, plot_id: PlotId) -> color_eyre::Result<()> {
-        let _: () = self
-            .redis
-            .clone()
-            .del(format!("plot:{}:baton_trust", plot_id))
+        let mut redis = self.redis.clone();
+        let _: () = redis.del(format!("plot:{}:baton_trust", plot_id)).await?;
+        Ok(())
+    }
+
+    pub async fn set_transfer(&self, plot_id: PlotId, payload: DfJson) -> color_eyre::Result<()> {
+        let mut redis = self.redis.clone();
+        let _: () = redis
+            .set_ex(format!("plot:{}:transfer", plot_id), payload, 10)
             .await?;
         Ok(())
     }

@@ -1,21 +1,32 @@
 use base64::{prelude::BASE64_STANDARD, Engine};
+use ed25519_dalek::{ed25519::signature::Keypair, SigningKey, VerifyingKey};
+use hmac::Hmac;
+use jwt::{FromBase64, SignWithKey, VerifyWithKey};
 use rand::distr::{Alphanumeric, SampleString};
 use redis::{aio::MultiplexedConnection, AsyncCommands};
+use reqwest::Client;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sqlx::{query, query_as, Pool, Postgres};
 use tracing::info;
 use uuid::Uuid;
 
-use crate::api::{auth::Plot, PlotId};
+use crate::{
+    api::{auth::{ExternalServer, Plot}, PlotId},
+    instance::{Instance, InstanceDomain},
+};
 
 pub mod baton;
+pub mod external;
 pub mod instance;
 
 #[derive(Clone)]
 pub struct Store {
     redis: MultiplexedConnection,
     pg: Pool<Postgres>,
+    client: Client,
+    jwt_key: Hmac<Sha256>,
+    secret_key: SigningKey,
 }
 
 pub struct KeyRow {
@@ -33,20 +44,19 @@ impl Store {
             return Ok(if plot.plot_id == -1 { None } else { Some(plot) });
         }
 
-        let plot = query_as!(
-            KeyRow,
+        let plot = query!(
             "
             SELECT
-                ak.plot,
+                key.plot,
                 p.owner_uuid,
-                p.instance
-            FROM
-                api_key ak
-            JOIN
-                plot p ON ak.plot = p.id
+                instance.domain,
+                instance.public_key
+            FROM api_key key
+            JOIN plot p ON key.plot = p.id
+            JOIN known_instance instance ON instance.id = p.id
             WHERE
-                ak.hashed_key = sha256($1) AND
-                ak.disabled = false;
+                key.hashed_key = sha256($1) AND
+                key.disabled = false;
             ",
             key.as_bytes()
         )
@@ -55,10 +65,11 @@ impl Store {
 
         let key = BASE64_STANDARD.encode(Sha256::digest(key));
         if let Some(plot) = plot {
+            let instance = Instance::from_row(plot.public_key, plot.domain)?;
             let uuid_plot = Plot {
                 plot_id: plot.plot,
                 owner: plot.owner_uuid,
-                instance: plot.instance.try_into()?,
+                instance,
             };
             let _: () = redis.set(format!("key:{}", key), &uuid_plot).await?;
             Ok(Some(uuid_plot))
@@ -70,7 +81,11 @@ impl Store {
                     Plot {
                         plot_id: -1,
                         owner: Uuid::from_u128(0),
-                        instance: None.try_into()?
+                        instance: Instance::new(
+                            VerifyingKey::from_bytes(b"--------------------------------")
+                                .expect("dummy value"),
+                            InstanceDomain::try_from(None).expect("dummy value"),
+                        ),
                     },
                 )
                 .await?;
@@ -134,6 +149,20 @@ impl Store {
                 .await?;
             Some(json.id)
         })
+    }
+    pub fn verify_jwt<T: FromBase64>(&self, jwt: &str) -> Option<T> {
+        VerifyWithKey::<T>::verify_with_key(jwt, &self.jwt_key).ok()
+    }
+    pub fn sign_jwt(&self, jwt: &ExternalServer) -> Result<String, jwt::Error> {
+        jwt.sign_with_key(&self.jwt_key)
+    }
+    pub async fn ping_instance(&self, instance: &InstanceDomain) -> color_eyre::Result<VerifyingKey> {
+        let domain: Option<&str> = instance.into();
+
+
+        self.client
+            .get(format!("https://{}/instance/v0/sign", domain));
+        return Ok(true)
     }
 }
 

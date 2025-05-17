@@ -1,16 +1,35 @@
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use hmac::Hmac;
 use redis::{aio::MultiplexedConnection, AsyncCommands};
 use redis_macros::{FromRedisValue, ToRedisArgs};
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use sqlx::{query, query_as, Pool, Postgres};
+use sha2::Sha256;
+use sqlx::{query, Pool, Postgres};
 use uuid::Uuid;
 
-use crate::{api::PlotId, instance::Instance};
+use crate::{
+    api::{auth::Plot, PlotId},
+    instance::{Instance, InstanceDomain},
+};
 
 use super::Store;
 
 impl Store {
-    pub fn new(redis: MultiplexedConnection, pg: Pool<Postgres>) -> Self {
-        Self { redis, pg }
+    pub fn new(
+        redis: MultiplexedConnection,
+        pg: Pool<Postgres>,
+        client: Client,
+        jwt_key: Hmac<Sha256>,
+        secret_key: SigningKey,
+    ) -> Self {
+        Self {
+            redis,
+            pg,
+            client,
+            jwt_key,
+            secret_key,
+        }
     }
 
     pub async fn plot_exists(&self, plot_id: PlotId) -> color_eyre::Result<bool> {
@@ -24,9 +43,9 @@ impl Store {
         }
     }
 
-    pub async fn get_plot_instance(&self, plot_id: PlotId) -> color_eyre::Result<Option<PlotValue>> {
+    pub async fn get_plot(&self, plot_id: PlotId) -> color_eyre::Result<Option<Plot>> {
         let mut redis = self.redis.clone();
-        let found: Option<PlotValue> = redis.get(format!("plot:{}", plot_id)).await?;
+        let found: Option<Plot> = redis.get(format!("plot:{}", plot_id)).await?;
 
         if let Some(val) = found {
             Ok(Some(val))
@@ -35,18 +54,19 @@ impl Store {
         }
     }
 
-    async fn cache_plot(&self, plot_id: PlotId) -> color_eyre::Result<Option<PlotValue>> {
-        let row = query_as!(
-            PlotRow,
-            "SELECT id, owner_uuid, instance FROM plot
-                WHERE id = $1;",
+    async fn cache_plot(&self, plot_id: PlotId) -> color_eyre::Result<Option<Plot>> {
+        let row = query!(
+            "SELECT plot.id, owner_uuid, known_instance.public_key, known_instance.domain FROM plot
+            INNER JOIN known_instance ON plot.instance = known_instance.id
+            WHERE plot.id = $1;",
             plot_id
         )
         .fetch_optional(&self.pg)
         .await?;
         Ok(if let Some(row) = row {
-            let instance: Instance = row.instance.try_into()?;
-            let value = PlotValue {
+            let instance: Instance = Instance::from_row(row.public_key, row.domain)?;
+            let value = Plot {
+                plot_id: row.id,
                 owner: row.owner_uuid,
                 instance,
             };
@@ -71,62 +91,74 @@ impl Store {
         &self,
         plot_id: PlotId,
         uuid: Uuid,
-        instance: &Instance,
+        instance_key: &VerifyingKey,
     ) -> color_eyre::Result<Result<(), RegisterError>> {
-        if !instance.vibe_check().await {
-            return Ok(Err(RegisterError::DomainCheckFailed));
-        }
-
         self.invalidate_plot_cache(plot_id).await?;
-        let str: Option<&String> = instance.into();
+        let key = instance_key.as_bytes();
+        let mut ta = self.pg.begin().await?;
+        let id = query!("SELECT id FROM known_instance WHERE public_key = $1", key)
+            .fetch_optional(&mut *ta)
+            .await?
+            .ok_or(RegisterError::InstanceNotFound)?
+            .id;
+
         match query!(
             "INSERT INTO plot (id, owner_uuid, instance) VALUES ($1, $2, $3)",
             plot_id,
             uuid,
-            str
+            id
         )
-        .execute(&self.pg)
+        .execute(&mut *ta)
         .await
         {
-            Ok(_) => Ok(Ok(())),
-            Err(kind) => match kind {
-                sqlx::Error::Database(err) => match err.kind() {
-                    sqlx::error::ErrorKind::UniqueViolation => Ok(Err(RegisterError::PlotTaken)),
-                    _ => Err(err.into()),
-                },
-                err => Err(err.into()),
-            },
-        }
+            Ok(_) => (),
+            Err(kind) => {
+                return match kind {
+                    sqlx::Error::Database(err) => match err.kind() {
+                        sqlx::error::ErrorKind::UniqueViolation => {
+                            Ok(Err(RegisterError::PlotTaken))
+                        }
+                        _ => Err(err.into()),
+                    },
+                    err => Err(err.into()),
+                }
+            }
+        };
+        ta.commit().await?;
+        Ok(Ok(()))
     }
     /// If result is Ok(true) it means success,
     /// Ok(false) means the instance didn't pass the vibe check
     pub async fn edit_plot(
         &self,
         plot_id: PlotId,
-        instance_domain: &Instance,
+        instance_key: &VerifyingKey,
     ) -> color_eyre::Result<Result<(), PlotEditError>> {
-        if !instance_domain.vibe_check().await {
-            return Ok(Err(PlotEditError::InvalidDomain));
-        }
-
         self.invalidate_plot_cache(plot_id).await?;
-        let domain: Option<&String> = instance_domain.into();
+        let key = instance_key.as_bytes();
+        let mut ta = self.pg.begin().await?;
+        let id = query!("SELECT id FROM known_instance WHERE public_key = $1", key)
+            .fetch_optional(&mut *ta)
+            .await?
+            .ok_or(RegisterError::InstanceNotFound)?
+            .id;
+
         let res = query!(
             "UPDATE plot SET
             instance = $2
             WHERE id = $1",
             plot_id,
-            domain
+            id
         )
         .execute(&self.pg)
         .await
         .expect("db shouldn't fail")
         .rows_affected();
-        if res == 1 {
-            Ok(Ok(()))
-        } else {
-            Ok(Err(PlotEditError::PlotNotFound))
+        if res != 1 {
+            return Ok(Err(PlotEditError::PlotNotFound));
         }
+        ta.commit().await?;
+        Ok(Ok(()))
     }
     /// Do not `tokio::task` this
     /// Invalidating caches should be a part of the update operation
@@ -140,16 +172,16 @@ impl Store {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RegisterError {
-    #[error("Domain check failed")]
-    DomainCheckFailed,
+    #[error("Instance not found, perhaps register it?")]
+    InstanceNotFound,
     #[error("Plot is already registered")]
     PlotTaken,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum PlotEditError {
-    #[error("Invalid domain")]
-    InvalidDomain,
+    #[error("Instance not found, perhaps register it?")]
+    InstanceNotFound,
     #[error("Plot not found")]
     PlotNotFound,
 }
@@ -157,12 +189,12 @@ pub enum PlotEditError {
 #[derive(Serialize, Deserialize, FromRedisValue, ToRedisArgs, Clone)]
 pub struct PlotValue {
     pub owner: Uuid,
-    pub instance: Instance,
+    pub instance: InstanceDomain,
 }
 
-#[allow(dead_code)]
-pub struct PlotRow {
-    id: i32,
-    owner_uuid: Uuid,
-    instance: Option<String>,
-}
+// #[allow(dead_code)]
+// pub struct PlotRow {
+//     id: i32,
+//     owner_uuid: Uuid,
+//     instance: Option<String>,
+// }
