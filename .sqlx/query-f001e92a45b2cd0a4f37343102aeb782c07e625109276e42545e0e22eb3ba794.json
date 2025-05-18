@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO baton_trust (plot, trusted) VALUES ($1, $2) \n                ON CONFLICT (plot, trusted) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f001e92a45b2cd0a4f37343102aeb782c07e625109276e42545e0e22eb3ba794"
+}

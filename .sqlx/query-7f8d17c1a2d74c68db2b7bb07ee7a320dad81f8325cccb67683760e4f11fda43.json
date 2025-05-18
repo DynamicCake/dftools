@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT trusted FROM baton_trust WHERE plot = $1;",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "trusted",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "7f8d17c1a2d74c68db2b7bb07ee7a320dad81f8325cccb67683760e4f11fda43"
+}

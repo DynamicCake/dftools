@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE plot SET\n            instance = $2\n            WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9087cedcc4676685effe7ee92c08a4099c6574d48686ba290f744ae949cb9d15"
+}

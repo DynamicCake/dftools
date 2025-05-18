@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT plot.id, owner_uuid, known_instance.public_key as \"public_key?\", known_instance.domain as \"domain?\" FROM plot\n            LEFT JOIN known_instance ON plot.instance = known_instance.id\n            WHERE plot.id = $1;",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "owner_uuid",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "public_key?",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 3,
+        "name": "domain?",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "be157431fdcaf6c12ec9ec17e35f07b3a129e56ae9cea60c5aab30267bc402ee"
+}

@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO api_key (plot, hashed_key) VALUES ($1, sha256($2))",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "25ea5721526bf8fee8a8a1a1dcf9c7b17f5a341886dd69f02b1b2313b348a8d5"
+}

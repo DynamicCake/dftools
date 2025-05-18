@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH disabled_keys AS (\n                UPDATE api_key SET\n                    disabled = true\n                WHERE \n                    plot = $1 \n                    AND disabled = false\n                RETURNING hashed_key\n            ) SELECT hashed_key FROM disabled_keys;",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "hashed_key",
+        "type_info": "Bytea"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "f86a0bd38898c244b27c7ba86f44ad8a9105015240762ecd2584689bc2385f6c"
+}
