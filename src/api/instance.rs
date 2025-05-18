@@ -1,23 +1,26 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use ascii_domain::dom::Domain;
-use base64::{prelude::BASE64_STANDARD, DecodeError, Engine};
+use base64::Engine;
 use ed25519_dalek::VerifyingKey;
-use jwt::{FromBase64, SignWithKey};
 use poem_openapi::{
     param::Query,
     payload::{Json, PlainText},
     ApiResponse, Object, OpenApi,
 };
-use sha2::{Digest, Sha256};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    instance::{Instance, InstanceDomain, SendInstance},
+    instance::{InstanceDomain, SendInstance},
     store::{
         instance::{PlotEditError, RegisterError},
         Store,
     },
+    BASE64,
 };
 
 use super::{
@@ -26,62 +29,80 @@ use super::{
 };
 
 pub struct InstanceApi {
-    pub store: Store,
+    pub store: Arc<Store>,
     pub domain: Domain<String>,
-    pub self_check_key: String,
 }
 
-#[derive(ApiResponse)]
-pub enum VibeCheckResult {
-    #[oai(status = 204)]
-    Passed,
-    #[oai(status = 200)]
-    KeyPassed(PlainText<&'static str>),
-    #[oai(status = 400)]
-    KeyVibecheckFailed,
+#[derive(Serialize, Deserialize, Object)]
+pub struct VerificationResponse {
+    /// Base64 encoded public key
+    pub server_key: String,
+    /// The signature to the of the sent text
+    pub signature: String,
 }
 
 #[derive(ApiResponse)]
 pub enum FetchTokenResponse {
+    /// Internal domain used
     #[oai(status = 400)]
-    InstanceParseError,
+    InternalDomainUsed,
+    /// Instance parse error
+    #[oai(status = 400)]
+    InstanceParseError(PlainText<String>),
+
+    /// Cannot ping instance
+    #[oai(status = 500)]
+    CannotPingInstance,
     /// Inconsistent Keys, returned body is the actual key
     #[oai(status = 403)]
     InconsistentKeys(PlainText<String>),
+    /// Ok
     #[oai(status = 200)]
     Ok(PlainText<String>),
 }
 
 #[OpenApi]
 impl InstanceApi {
-    /// Give the server a vibe check
-    ///
-    /// If you are another instance, call this endpoint to get info on this server.
-    /// To verify that the config domain is you own domain, hit this endpoint with your self check key.
-    #[oai(path = "/ping", method = "get")]
-    async fn vibecheck(&self, key: Query<Option<String>>) -> VibeCheckResult {
-        if let Some(key) = key.0 {
-            let hash: [u8; 32] = Sha256::digest(key).into();
-            let actual = self.get_vibecheck_hash();
-            if hash == actual {
-                return VibeCheckResult::KeyPassed(PlainText("You are you"));
-            } else {
-                return VibeCheckResult::KeyVibecheckFailed;
-            }
-        }
-        VibeCheckResult::Passed
+    /// Get the server's public key
+    #[oai(path = "/sign", method = "get")]
+    async fn vibecheck(&self, tosign: Query<String>) -> Json<VerificationResponse> {
+        let sig = self.store.sign(tosign.0.as_bytes()).await;
+        Json(VerificationResponse {
+            server_key: BASE64.encode(self.store.public_key()),
+            signature: BASE64.encode(sig.to_bytes()),
+        })
     }
 
+    /// Provide your server domain and identity key for a jwt to communicate with the server
     #[oai(path = "/server-token", method = "get")]
-    async fn get_server_token(&self, instance: Json<SendInstance>) -> FetchTokenResponse {
-        let pinstance = if let Ok(inst) = instance.0.parse() {
-            inst
-        } else {
-            return FetchTokenResponse::InstanceParseError;
+    async fn get_server_token(
+        &self,
+        key: Query<String>,
+        domain: Query<String>,
+    ) -> FetchTokenResponse {
+        let send_instance = SendInstance {
+            key: key.0,
+            domain: domain.0,
         };
-        let ok = self.store.ping_instance(&pinstance).await.expect("Error while verifying instance");
-        if !ok {
-            return FetchTokenResponse::InconsistentKeys()
+        let claimed_instance = match send_instance.parse() {
+            Ok(inst) => inst,
+            Err(err) => return FetchTokenResponse::InstanceParseError(PlainText(err.to_string())),
+        };
+        let domain = if let InstanceDomain::External(ext) = claimed_instance.domain {
+            ext
+        } else {
+            return FetchTokenResponse::InternalDomainUsed;
+        };
+        if self.store.public_key() == claimed_instance.key {
+            return FetchTokenResponse::InternalDomainUsed;
+        }
+        let tok = if let Ok(tok) = self.store.ping_instance(&domain).await {
+            tok
+        } else {
+            return FetchTokenResponse::CannotPingInstance;
+        };
+        if claimed_instance.key != tok {
+            return FetchTokenResponse::InconsistentKeys(PlainText(BASE64.encode(tok)));
         }
 
         const JWT_EXPIRY: u64 = 60 * 60 * 3;
@@ -90,10 +111,10 @@ impl InstanceApi {
             .expect("Time went backwards")
             .as_secs();
         let token = ExternalServer {
-            sub: instance.0,
+            sub: send_instance,
             iat: issued,
             exp: issued + JWT_EXPIRY,
-            jti: Uuid::new_v4()
+            jti: Uuid::new_v4(),
         };
         let signed = self.store.sign_jwt(&token).expect("signing failed");
 
@@ -121,13 +142,11 @@ impl InstanceApi {
         }
     }
 
-    /// Register the plot to an instance
-    ///
-    /// Leave the body blank to register to this instance
+    /// Register the plot to an instance with the public key
     #[oai(path = "/plot", method = "post")]
     async fn register(
         &self,
-        instance_key: PlainText<String>,
+        instance_key: Json<Option<String>>,
         auth: UnregisteredAuth,
     ) -> RegisterResult {
         let plot = auth.0;
@@ -142,40 +161,88 @@ impl InstanceApi {
             return RegisterResult::CannotFetchUuid;
         };
 
-        let key = match VerifyingKey::from_base64(&instance_key.0) {
-            Ok(key) => key,
-            Err(err) => return RegisterResult::InvalidKeyFormat(PlainText(err.to_string())),
+        let key = if let Some(key) = &instance_key.0 {
+            let key = match BASE64.decode(key) {
+                Ok(key) => key,
+                Err(err) => {
+                    return RegisterResult::InvalidKeyFormat(PlainText(format!(
+                        "base64 decode: {}",
+                        err
+                    )))
+                }
+            };
+            let key: [u8; 32] = match key.as_slice().try_into() {
+                Ok(key) => key,
+                Err(err) => return RegisterResult::InvalidKeyFormat(PlainText(err.to_string())),
+            };
+            match VerifyingKey::from_bytes(&key) {
+                Ok(key) => Some(key),
+                Err(err) => {
+                    return RegisterResult::InvalidKeyFormat(PlainText(format!(
+                        "converting to verify key failed: {}",
+                        err
+                    )))
+                }
+            }
+        } else {
+            None
         };
         match self
             .store
-            .register_plot(plot.plot_id, uuid, &key)
+            .register_plot(plot.plot_id, uuid, key.as_ref())
             .await
             .expect("store shouldn't fail")
         {
             Ok(_) => RegisterResult::Ok,
             Err(err) => match err {
                 RegisterError::PlotTaken => RegisterResult::PlotAlreadyExists,
-                RegisterError::InstanceNotFound => RegisterResult::InstanceNotRegisterd,
+                RegisterError::InstanceNotFound => {
+                    RegisterResult::InstanceNotRegistered(PlainText("Instance not registered"))
+                }
             },
         }
     }
 
-    /// Change the plot instance
+    /// Change the plot instance with the public key
     #[oai(path = "/plot", method = "put")]
     async fn replace_instance(
         &self,
-        instance_key: Json<String>,
+        instance_key: Json<Option<String>>,
         auth: Auth,
     ) -> ReplaceInstanceResult {
         let plot = auth.plot();
 
-        let key = match VerifyingKey::from_base64(&instance_key.0) {
-            Ok(key) => key,
-            Err(err) => return ReplaceInstanceResult::InvalidKeyFormat(PlainText(err.to_string())),
+        let key = if let Some(key) = &instance_key.0 {
+            let key = match BASE64.decode(key) {
+                Ok(key) => key,
+                Err(err) => {
+                    return ReplaceInstanceResult::InvalidKeyFormat(PlainText(format!(
+                        "base64 decode: {}",
+                        err
+                    )))
+                }
+            };
+            let key: [u8; 32] = match key.as_slice().try_into() {
+                Ok(key) => key,
+                Err(err) => {
+                    return ReplaceInstanceResult::InvalidKeyFormat(PlainText(err.to_string()))
+                }
+            };
+            match VerifyingKey::from_bytes(&key) {
+                Ok(key) => Some(key),
+                Err(err) => {
+                    return ReplaceInstanceResult::InvalidKeyFormat(PlainText(format!(
+                        "converting to verify key failed: {}",
+                        err
+                    )))
+                }
+            }
+        } else {
+            None
         };
         if let Err(err) = self
             .store
-            .edit_plot(plot.plot_id, &key)
+            .edit_plot(plot.plot_id, key.as_ref())
             .await
             .expect("store ops shouldn't fail")
         {
@@ -208,13 +275,6 @@ impl InstanceApi {
     }
 }
 
-impl InstanceApi {
-    fn get_vibecheck_hash(&self) -> [u8; 32] {
-        let hashed = Sha256::digest(&self.self_check_key);
-        hashed.into()
-    }
-}
-
 #[derive(ApiResponse)]
 enum ReplaceInstanceResult {
     /// Plot not found
@@ -238,7 +298,7 @@ enum RegisterResult {
     CannotFetchUuid,
     /// An instance with this key is not registered
     #[oai(status = 400)]
-    InstanceNotRegisterd,
+    InstanceNotRegistered(PlainText<&'static str>),
     /// Invalid key format
     #[oai(status = 400)]
     InvalidKeyFormat(PlainText<String>),

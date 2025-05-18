@@ -1,5 +1,7 @@
-use base64::{prelude::BASE64_STANDARD, Engine};
-use ed25519_dalek::{ed25519::signature::Keypair, SigningKey, VerifyingKey};
+use base64::Engine;
+use chrono::Local;
+use color_eyre::eyre::Context;
+use ed25519_dalek::{ed25519::signature::SignerMut, Signature, SigningKey, VerifyingKey};
 use hmac::Hmac;
 use jwt::{FromBase64, SignWithKey, VerifyWithKey};
 use rand::distr::{Alphanumeric, SampleString};
@@ -7,32 +9,31 @@ use redis::{aio::MultiplexedConnection, AsyncCommands};
 use reqwest::Client;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use sqlx::{query, query_as, Pool, Postgres};
+use sqlx::{prelude::FromRow, query, query_as, Pool, Postgres};
+use tokio::sync::RwLock;
 use tracing::info;
 use uuid::Uuid;
 
 use crate::{
-    api::{auth::{ExternalServer, Plot}, PlotId},
-    instance::{Instance, InstanceDomain},
+    api::{
+        auth::{ExternalServer, Plot},
+        instance::VerificationResponse,
+        PlotId,
+    },
+    instance::{ExternalDomain, Instance, InstanceDomain},
+    BASE64,
 };
 
 pub mod baton;
-pub mod external;
 pub mod instance;
 
-#[derive(Clone)]
 pub struct Store {
     redis: MultiplexedConnection,
     pg: Pool<Postgres>,
     client: Client,
     jwt_key: Hmac<Sha256>,
-    secret_key: SigningKey,
-}
-
-pub struct KeyRow {
-    plot: PlotId,
-    owner_uuid: Uuid,
-    instance: Option<String>,
+    secret_key: RwLock<SigningKey>,
+    public_key: VerifyingKey,
 }
 
 /// Misc
@@ -44,7 +45,16 @@ impl Store {
             return Ok(if plot.plot_id == -1 { None } else { Some(plot) });
         }
 
-        let plot = query!(
+        #[derive(FromRow)]
+        struct Row {
+            plot: PlotId,
+            owner_uuid: Uuid,
+            domain: Option<String>,
+            public_key: Option<Vec<u8>>,
+        }
+
+        let plot = query_as!(
+            Row,
             "
             SELECT
                 key.plot,
@@ -53,7 +63,7 @@ impl Store {
                 instance.public_key
             FROM api_key key
             JOIN plot p ON key.plot = p.id
-            JOIN known_instance instance ON instance.id = p.id
+            LEFT JOIN known_instance instance ON instance.id = p.instance
             WHERE
                 key.hashed_key = sha256($1) AND
                 key.disabled = false;
@@ -63,16 +73,24 @@ impl Store {
         .fetch_optional(&self.pg)
         .await?;
 
-        let key = BASE64_STANDARD.encode(Sha256::digest(key));
+        let key = BASE64.encode(Sha256::digest(key));
         if let Some(plot) = plot {
-            let instance = Instance::from_row(plot.public_key, plot.domain)?;
-            let uuid_plot = Plot {
-                plot_id: plot.plot,
-                owner: plot.owner_uuid,
-                instance,
+            let plot = if let Some(key) = plot.public_key {
+                let instance = Instance::from_row(key, plot.domain)?;
+                Plot {
+                    plot_id: plot.plot,
+                    owner: plot.owner_uuid,
+                    instance,
+                }
+            } else {
+                Plot {
+                    plot_id: plot.plot,
+                    owner: plot.owner_uuid,
+                    instance: self.construct_current_instance(),
+                }
             };
-            let _: () = redis.set(format!("key:{}", key), &uuid_plot).await?;
-            Ok(Some(uuid_plot))
+            let _: () = redis.set(format!("key:{}", key), &plot).await?;
+            Ok(Some(plot))
         } else {
             let _: () = redis
                 .set(
@@ -81,15 +99,17 @@ impl Store {
                     Plot {
                         plot_id: -1,
                         owner: Uuid::from_u128(0),
-                        instance: Instance::new(
-                            VerifyingKey::from_bytes(b"--------------------------------")
-                                .expect("dummy value"),
-                            InstanceDomain::try_from(None).expect("dummy value"),
-                        ),
+                        instance: Instance::new(self.public_key, InstanceDomain::Current),
                     },
                 )
                 .await?;
             Ok(None)
+        }
+    }
+    pub fn construct_current_instance(&self) -> Instance {
+        Instance {
+            key: self.public_key,
+            domain: InstanceDomain::Current,
         }
     }
     pub async fn create_key(&self, plot_id: PlotId) -> color_eyre::Result<String> {
@@ -118,7 +138,7 @@ impl Store {
         .fetch_all(&self.pg)
         .await?;
         for row in deleted {
-            let key = BASE64_STANDARD.encode(row.hashed_key);
+            let key = BASE64.encode(row.hashed_key);
             info!("{key}");
             let _: () = self.redis.clone().del(format!("key:{key}")).await?;
         }
@@ -156,13 +176,58 @@ impl Store {
     pub fn sign_jwt(&self, jwt: &ExternalServer) -> Result<String, jwt::Error> {
         jwt.sign_with_key(&self.jwt_key)
     }
-    pub async fn ping_instance(&self, instance: &InstanceDomain) -> color_eyre::Result<VerifyingKey> {
-        let domain: Option<&str> = instance.into();
+    pub async fn sign(&self, msg: &[u8]) -> Signature {
+        self.secret_key.write().await.sign(msg)
+    }
+    pub async fn ping_instance(
+        &self,
+        instance: &ExternalDomain,
+    ) -> color_eyre::Result<VerifyingKey> {
+        let domain = instance.inner().as_inner();
 
+        let verify_body = Local::now()
+            .format("DFTOOLS VERIFY %Y-%m-%d %H:%M:%S%.3f")
+            .to_string();
 
-        self.client
-            .get(format!("https://{}/instance/v0/sign", domain));
-        return Ok(true)
+        #[cfg(debug_assertions)]
+        let url = format!("http://{}/instance/v0/sign", domain);
+        #[cfg(not(debug_assertions))]
+        let url = format!("https://{}/instance/v0/sign", domain);
+        info!("{}", url);
+        let req = self
+            .client
+            .get(url)
+            .query(&[("tosign", &verify_body)])
+            .send()
+            .await?;
+        let body = req.text().await?;
+        let json: VerificationResponse =
+            serde_json::from_str(&body).wrap_err("Probably due to not being a dftools server")?;
+        let key = VerifyingKey::from_bytes(
+            BASE64
+                .decode(json.server_key)
+                .wrap_err("Server key")?
+                .as_slice()
+                .try_into()
+                .wrap_err("Expected 32 bytes")?,
+        )
+        .wrap_err("Interpreting server key")?;
+        let sig = Signature::from_bytes(
+            BASE64
+                .decode(json.signature)
+                .wrap_err("Signature")?
+                .as_slice()
+                .try_into()
+                .wrap_err("Expected 64 bytes for sig")?,
+        );
+        let _: () = key
+            .verify_strict(verify_body.as_bytes(), &sig)
+            .wrap_err("Invalid signature")?;
+        Ok(key)
+    }
+
+    pub fn public_key(&self) -> VerifyingKey {
+        self.public_key
     }
 }
 

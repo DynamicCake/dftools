@@ -5,12 +5,12 @@ use redis_macros::{FromRedisValue, ToRedisArgs};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use sqlx::{query, Pool, Postgres};
+use sqlx::{query, query_as, Pool, Postgres};
 use uuid::Uuid;
 
 use crate::{
     api::{auth::Plot, PlotId},
-    instance::{Instance, InstanceDomain},
+    instance::{ExternalDomain, Instance},
 };
 
 use super::Store;
@@ -28,7 +28,8 @@ impl Store {
             pg,
             client,
             jwt_key,
-            secret_key,
+            public_key: secret_key.verifying_key(),
+            secret_key: secret_key.into(),
         }
     }
 
@@ -55,34 +56,43 @@ impl Store {
     }
 
     async fn cache_plot(&self, plot_id: PlotId) -> color_eyre::Result<Option<Plot>> {
-        let row = query!(
-            "SELECT plot.id, owner_uuid, known_instance.public_key, known_instance.domain FROM plot
-            INNER JOIN known_instance ON plot.instance = known_instance.id
-            WHERE plot.id = $1;",
+        struct Row {
+            id: PlotId,
+            owner_uuid: Uuid,
+            public_key: Option<Vec<u8>>,
+            domain: Option<String>,
+        }
+        let plot = query_as!(
+            Row,
+            r#"SELECT plot.id, owner_uuid, known_instance.public_key as "public_key?", known_instance.domain as "domain?" FROM plot
+            LEFT JOIN known_instance ON plot.instance = known_instance.id
+            WHERE plot.id = $1;"#,
             plot_id
         )
         .fetch_optional(&self.pg)
         .await?;
-        Ok(if let Some(row) = row {
-            let instance: Instance = Instance::from_row(row.public_key, row.domain)?;
-            let value = Plot {
-                plot_id: row.id,
-                owner: row.owner_uuid,
-                instance,
-            };
 
-            let moved = value.clone();
-            let mut redis = self.redis.clone();
-            tokio::spawn(async move {
-                let _: () = redis
-                    .set(format!("plot:{}", plot_id), moved)
-                    .await
-                    .expect("Cache cannot be written to");
-            });
-            Some(value)
+        let mut redis = self.redis.clone();
+        if let Some(plot) = plot {
+            let plot = if let Some(key) = plot.public_key {
+                let instance = Instance::from_row(key, plot.domain)?;
+                Plot {
+                    plot_id: plot.id,
+                    owner: plot.owner_uuid,
+                    instance,
+                }
+            } else {
+                Plot {
+                    plot_id: plot.id,
+                    owner: plot.owner_uuid,
+                    instance: self.construct_current_instance(),
+                }
+            };
+            let _: () = redis.set(format!("plot:{}", plot_id), &plot).await?;
+            Ok(Some(plot))
         } else {
-            None
-        })
+            Ok(None)
+        }
     }
 
     /// You are supposed to unwrap the eyre result, which is almost always ok,
@@ -91,16 +101,23 @@ impl Store {
         &self,
         plot_id: PlotId,
         uuid: Uuid,
-        instance_key: &VerifyingKey,
+        instance_key: Option<&VerifyingKey>,
     ) -> color_eyre::Result<Result<(), RegisterError>> {
         self.invalidate_plot_cache(plot_id).await?;
-        let key = instance_key.as_bytes();
         let mut ta = self.pg.begin().await?;
-        let id = query!("SELECT id FROM known_instance WHERE public_key = $1", key)
-            .fetch_optional(&mut *ta)
-            .await?
-            .ok_or(RegisterError::InstanceNotFound)?
-            .id;
+        let id = if let Some(key) = instance_key {
+            let key = key.as_ref();
+            let id = query!("SELECT id FROM known_instance WHERE public_key = $1", key)
+                .fetch_optional(&mut *ta)
+                .await?;
+            if let Some(it) = id {
+                Some(it.id)
+            } else {
+                return Ok(Err(RegisterError::InstanceNotFound));
+            }
+        } else {
+            None
+        };
 
         match query!(
             "INSERT INTO plot (id, owner_uuid, instance) VALUES ($1, $2, $3)",
@@ -132,16 +149,23 @@ impl Store {
     pub async fn edit_plot(
         &self,
         plot_id: PlotId,
-        instance_key: &VerifyingKey,
+        instance_key: Option<&VerifyingKey>,
     ) -> color_eyre::Result<Result<(), PlotEditError>> {
         self.invalidate_plot_cache(plot_id).await?;
-        let key = instance_key.as_bytes();
         let mut ta = self.pg.begin().await?;
-        let id = query!("SELECT id FROM known_instance WHERE public_key = $1", key)
-            .fetch_optional(&mut *ta)
-            .await?
-            .ok_or(RegisterError::InstanceNotFound)?
-            .id;
+        let id = if let Some(key) = instance_key {
+            let key = key.as_bytes();
+            let id = query!("SELECT id FROM known_instance WHERE public_key = $1", key)
+                .fetch_optional(&mut *ta)
+                .await?;
+            if let Some(it) = id {
+                Some(it.id)
+            } else {
+                return Ok(Err(PlotEditError::InstanceNotFound));
+            }
+        } else {
+            None
+        };
 
         let res = query!(
             "UPDATE plot SET
@@ -189,12 +213,5 @@ pub enum PlotEditError {
 #[derive(Serialize, Deserialize, FromRedisValue, ToRedisArgs, Clone)]
 pub struct PlotValue {
     pub owner: Uuid,
-    pub instance: InstanceDomain,
+    pub instance: ExternalDomain,
 }
-
-// #[allow(dead_code)]
-// pub struct PlotRow {
-//     id: i32,
-//     owner_uuid: Uuid,
-//     instance: Option<String>,
-// }

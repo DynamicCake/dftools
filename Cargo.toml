@@ -8,7 +8,6 @@ argon2 = "0.5.3"
 ascii_domain = { version = "0.6.4", features = ["serde"] }
 base64 = "0.22.1"
 chrono = { version = "0.4.40", features = ["now"] }
-clap = { version = "4.5.35", features = ["derive"] }
 color-eyre = "0.6.3"
 dotenvy = "0.15.7"
 envy = "0.4.2"

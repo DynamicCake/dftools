@@ -6,7 +6,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, JsonSchema, Union, ToRedisArgs, FromRedisValue)]
-#[oai(discriminator_name = "id")]
+#[oai(discriminator_name = "id", rename_all = "snake_case")]
 #[serde(tag = "id")]
 #[serde(rename_all = "snake_case")]
 pub enum DfJson {

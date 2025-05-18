@@ -1,12 +1,17 @@
+use std::sync::Arc;
+
 use futures::{stream, StreamExt};
 use poem_openapi::{param::Query, payload::Json, ApiResponse, OpenApi};
 
 use crate::{dfjson::DfJson, store::Store};
 
-use super::{auth::Auth, PlotId};
+use super::{
+    auth::{Auth, ExternalServerAuth},
+    PlotId,
+};
 
 pub struct BatonApi {
-    pub store: Store,
+    pub store: Arc<Store>,
 }
 
 #[OpenApi]
@@ -59,6 +64,7 @@ impl BatonApi {
     /// TODO: Finish making this function lol
     #[oai(path = "/transfer", method = "post")]
     async fn transfer(&self, dest: Query<PlotId>) -> SetTransferResult {
+        todo!();
         let found = if let Some(it) = self
             .store
             .get_plot(dest.0)
@@ -84,21 +90,42 @@ impl BatonApi {
         */
 
     /// [EXT] Set transfer to a plot managed by this instance
-    #[oai(path = "/send/transfer", method = "get")]
+    #[oai(path = "/send/transfer", method = "post")]
     async fn transfer_recv(
         &self,
-        plot_id: Query<PlotId>,
+        from_plot_id: Query<PlotId>,
+        to_plot_id: Query<PlotId>,
         payload: Json<DfJson>,
+        auth: ExternalServerAuth,
     ) -> TransferSendResult {
-        let plot_id = plot_id.0;
-        let plot = self
+        let auth = auth
+            .0
+            .sub
+            .parse()
+            .expect("Server should create good send instances");
+        let trust = self
             .store
-            .get_plot(plot_id)
+            .fetch_plot_trust(to_plot_id.0)
             .await
             .expect("store ops shouldn't fail");
 
+        let from = from_plot_id.0;
+        if !trust.contains(&from) {
+            return TransferSendResult::NotTrusted;
+        }
+        let plot = self
+            .store
+            .get_plot(from)
+            .await
+            .expect("Store ops shouldn't fail")
+            .expect("Trust contains from");
+        // plot.instance
+        if auth != plot.instance {
+            return TransferSendResult::NotTrusted;
+        }
+
         self.store
-            .set_transfer(plot_id, payload.0)
+            .set_transfer(from, payload.0)
             .await
             .expect("store ops shouldn't fail");
         TransferSendResult::Ok
@@ -108,9 +135,7 @@ impl BatonApi {
 #[derive(ApiResponse)]
 enum TransferSendResult {
     #[oai(status = 409)]
-    PlotInstanceInconsistency(Json<Option<String>>),
-    #[oai(status = 404)]
-    PlotNotFound,
+    NotTrusted,
     #[oai(status = 200)]
     Ok,
 }

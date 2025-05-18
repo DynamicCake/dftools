@@ -1,10 +1,11 @@
 use std::{
     net::{Ipv4Addr, SocketAddr},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use poem::{error::ResponseError, Request};
-use poem_openapi::{auth::ApiKey, ApiResponse, Object, SecurityScheme};
+use poem_openapi::{auth::ApiKey, Object, SecurityScheme};
 use redis_macros::{FromRedisValue, ToRedisArgs};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -144,7 +145,7 @@ pub struct Plot {
 pub struct KeyAuth(pub Plot);
 
 async fn key_checker(req: &Request, auth: ApiKey) -> poem::Result<Plot> {
-    let store: &Store = req.data().expect("Store should be there");
+    let store: &Arc<Store> = req.data().expect("Store should be there");
     Ok(store
         .verify_key(&auth.key)
         .await
@@ -187,7 +188,7 @@ const DF_IPS: [Ipv4Addr; 1] = [Ipv4Addr::new(51, 222, 245, 229)];
 
 async fn plot_checker(req: &Request, user_agent: ApiKey) -> poem::Result<Plot> {
     let unreg = check_unreg_plot(req, user_agent).await?;
-    let store: &Store = req.data().expect("Server should have store");
+    let store: &Arc<Store> = req.data().expect("Server should have store");
     let plot = store
         .get_plot(unreg.plot_id)
         .await
