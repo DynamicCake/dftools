@@ -20,9 +20,10 @@ services:
     restart: unless-stopped
 
   dftools:
+    init: true
     build: .
     ports:
-      - ${DFT_PORT:-3000}
+      - ${DFT_PORT:-3000}:${DFT_PORT:-3000}
     depends_on:
       - postgres
       - redis
@@ -34,8 +35,6 @@ services:
       JWT_KEY: ${DFT_JWT_KEY}
       SECRET_KEY: ${DFT_SECRET_KEY}
     restart: unless-stopped
-
-# 
 
 volumes:
   postgres_data:

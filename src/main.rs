@@ -1,7 +1,7 @@
-use std::{env::args, fs::read_to_string, sync::Arc};
+use std::{fs::read_to_string, sync::Arc};
 
 use api::{baton::BatonApi, instance::InstanceApi};
-use base64::{engine::GeneralPurpose, prelude::{BASE64_URL_SAFE, BASE64_URL_SAFE_NO_PAD}, Engine};
+use base64::{engine::GeneralPurpose, prelude::BASE64_URL_SAFE, Engine};
 use color_eyre::eyre::Context;
 use dfjson::DfJson;
 use ed25519_dalek::SigningKey;
@@ -84,10 +84,14 @@ async fn main() -> color_eyre::Result<()> {
     )
     .server(format!("http://localhost:{}/baton/v0", config.port));
 
-    let app = Route::new()
+    let app = Route::new();
+    // This is an open source project and protocol, it is fine to expose the swagger ui
+    // #[cfg(debug_assertions)]
+    let app = app
         .nest("/instance/v0/docs", instance_api_service.swagger_ui())
+        .nest("/baton/v0/docs", baton_api_service.swagger_ui());
+    let app = app
         .nest("/instance/v0", instance_api_service)
-        .nest("/baton/v0/docs", baton_api_service.swagger_ui())
         .nest("/baton/v0", baton_api_service)
         .data(store);
 

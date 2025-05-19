@@ -9,6 +9,7 @@ case "$arg" in
         openssl rand 64 | base64 -w 0 | tr '+/' '-_'
         ;;
     "")
+        echo "Usage: dftools_secret.sh (gen-key|gen-jwt)"
         ;;
     *)
         echo "Unknown operation $arg"
