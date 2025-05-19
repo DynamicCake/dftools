@@ -1,31 +1,114 @@
 {
-  description = "Rust dev environment";
+  description = "Build a cargo project which uses SQLx";
 
-  inputs = {nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";};
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
 
-  outputs = {
-    self,
-    nixpkgs,
-  }: let
-    allSystems = ["x86_64-linux" "aarch64-darwin"];
-    # Found from
-    # https://git.dyncake.dev/cake/devshell-basic
-    forAllSystems = fn:
-      nixpkgs.lib.genAttrs allSystems
-      (system: fn {pkgs = import nixpkgs {inherit system;};});
-  in {
-    devShells = forAllSystems ({pkgs}: {
-      default = pkgs.mkShell {
-        # name = "nix";
-        nativeBuildInputs = with pkgs; [
-          cargo
-          rustc
-          pkg-config
-          openssl
-          sqlx-cli
-          clippy
-        ];
-      };
-    });
+    crane.url = "github:ipetkov/crane";
+
+    flake-utils.url = "github:numtide/flake-utils";
   };
+
+  outputs =
+    {
+      self,
+      nixpkgs,
+      crane,
+      flake-utils,
+      ...
+    }:
+    flake-utils.lib.eachDefaultSystem (
+      system:
+      let
+        pkgs = nixpkgs.legacyPackages.${system};
+
+        inherit (pkgs) lib;
+
+        craneLib = crane.mkLib pkgs;
+
+        unfilteredRoot = ./.; # The original, unfiltered source
+        src = lib.fileset.toSource {
+          root = unfilteredRoot;
+          fileset = lib.fileset.unions [
+            # Default files from crane (Rust and cargo files)
+            (craneLib.fileset.commonCargoSources unfilteredRoot)
+            # Include all the .sql migrations as well
+            ./migrations
+            ./.sqlx
+          ];
+        };
+
+        # Common arguments can be set here to avoid repeating them later
+        commonArgs = {
+          inherit src;
+          strictDeps = true;
+
+          nativeBuildInputs = [
+            pkgs.pkg-config
+          ];
+
+          buildInputs =
+            [
+              # Add additional build inputs here
+              pkgs.openssl
+            ]
+            ++ lib.optionals pkgs.stdenv.isDarwin [
+              # Additional darwin specific inputs can be set here
+              pkgs.libiconv
+              pkgs.darwin.apple_sdk.frameworks.Security
+            ];
+
+          # Additional environment variables can be set directly
+          # MY_CUSTOM_VAR = "some value";
+        };
+
+        # Build *just* the cargo dependencies, so we can reuse
+        # all of that work (e.g. via cachix) when running in CI
+        cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+
+        # Build the actual crate itself, reusing the dependency
+        # artifacts from above.
+        my-crate = craneLib.buildPackage (
+          commonArgs
+          // {
+            inherit cargoArtifacts;
+
+            nativeBuildInputs = (commonArgs.nativeBuildInputs or [ ]) ++ [
+              pkgs.sqlx-cli
+            ];
+
+            preBuild = ''
+              # We are using ./.sqlx instead
+              # export DATABASE_URL=...
+              # sqlx database create
+              # sqlx migrate run
+            '';
+          }
+        );
+      in
+      {
+        checks = {
+          # Build the crate as part of `nix flake check` for convenience
+          inherit my-crate;
+        };
+
+        packages = {
+          default = my-crate;
+          inherit my-crate;
+        };
+
+        devShells.default = craneLib.devShell {
+          # Inherit inputs from checks.
+          checks = self.checks.${system};
+
+          # Additional dev-shell environment variables can be set directly
+          # MY_CUSTOM_DEVELOPMENT_VAR = "something else";
+
+          # Extra inputs can be added here; cargo and rustc are provided by default.
+          packages = [
+            pkgs.sqlx-cli
+          ];
+        };
+      }
+    );
 }
